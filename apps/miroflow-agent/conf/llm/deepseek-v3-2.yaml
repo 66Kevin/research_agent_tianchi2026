@@ -1,0 +1,10 @@
+# conf/llm/deepseek-v3-2.yaml
+defaults:
+  - default
+  - _self_
+
+provider: "deepseek"
+model_name: "deepseek-chat"
+base_url: https://api.deepseek.com
+max_context_length: 65536
+api_key: "xxx"
