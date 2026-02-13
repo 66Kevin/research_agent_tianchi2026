@@ -20,4 +20,4 @@
 - 后处理：json-repair防止输出为非json结构，LLM最后的输出检查
 - 时间限制优化：限制10min内，时间优化（越短越好）
 - Ensemble策略：运行多次进行ensemble，但是要考虑时间问题！！
-- 
+- tool calling优化：什么时候用google，什么时候用国内搜索api，fallback机制/策略
