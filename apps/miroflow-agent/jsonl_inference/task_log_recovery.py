@@ -5,6 +5,7 @@ import json
 import os
 import re
 from dataclasses import asdict
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -18,6 +19,7 @@ from src.utils.prompt_utils import (
 TASK_LOG_FILENAME_PATTERN = re.compile(
     r"^task_(?P<task_id>.+?)_attempt-(?P<attempt>\d+)_format-retry-(?P<retry>\d+)_(?P<timestamp>\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2})\.json$"
 )
+TASK_LOG_DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 
 def task_key(task_id: Any) -> str:
@@ -143,6 +145,99 @@ def write_final_answers_jsonl(
         {
             "id": result.task_id,
             "answer": result.model_boxed_answer or "",
+        }
+        for result in ordered_results
+    ]
+    write_jsonl_atomic(output_path, rows)
+
+
+def _log_duration_seconds(log_data: Dict[str, Any]) -> float:
+    start_time = log_data.get("start_time")
+    end_time = log_data.get("end_time")
+
+    if (
+        isinstance(start_time, str)
+        and isinstance(end_time, str)
+        and start_time
+        and end_time
+    ):
+        try:
+            start_dt = datetime.strptime(start_time, TASK_LOG_DATETIME_FORMAT)
+            end_dt = datetime.strptime(end_time, TASK_LOG_DATETIME_FORMAT)
+            return max((end_dt - start_dt).total_seconds(), 0.0)
+        except ValueError:
+            pass
+
+    trace_data = log_data.get("trace_data", {})
+    performance_summary = (
+        trace_data.get("performance_summary", {}) if isinstance(trace_data, dict) else {}
+    )
+    fallback_wall_time = (
+        performance_summary.get("total_wall_time")
+        if isinstance(performance_summary, dict)
+        else None
+    )
+    if isinstance(fallback_wall_time, (int, float)):
+        return max(float(fallback_wall_time), 0.0)
+
+    return 0.0
+
+
+def _format_hhmmss(total_seconds: float) -> str:
+    seconds = int(max(total_seconds, 0.0))
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    remaining_seconds = seconds % 60
+    return f"{hours:02d}:{minutes:02d}:{remaining_seconds:02d}"
+
+
+def _collect_task_runtime_seconds(run_dir: Path) -> Dict[str, float]:
+    latest_logs_by_group: Dict[Tuple[str, int, int], Dict[str, Any]] = {}
+
+    for log_path in sorted(run_dir.glob("task_*.json")):
+        parsed = _parse_task_log_filename(log_path.name)
+        if parsed is None:
+            continue
+
+        task_id_str, attempt_number, format_retry, timestamp = parsed
+        group_key = (task_id_str, attempt_number, format_retry)
+
+        current = latest_logs_by_group.get(group_key)
+        if current is not None and timestamp <= current["timestamp"]:
+            continue
+
+        try:
+            with open(log_path, "r", encoding="utf-8") as f:
+                log_data = json.load(f)
+        except Exception as e:
+            print(f"Warning: failed to read task log {log_path}: {e}")
+            continue
+
+        latest_logs_by_group[group_key] = {
+            "timestamp": timestamp,
+            "log_data": log_data,
+        }
+
+    runtime_by_task: Dict[str, float] = {}
+    for (task_id_str, _, _), payload in latest_logs_by_group.items():
+        duration_seconds = _log_duration_seconds(payload["log_data"])
+        runtime_by_task[task_id_str] = runtime_by_task.get(task_id_str, 0.0) + max(
+            duration_seconds, 0.0
+        )
+
+    return runtime_by_task
+
+
+def write_task_runtimes_jsonl(
+    output_path: Path, ordered_results: List[BenchmarkResult], run_dir: Path
+) -> None:
+    runtime_by_task = _collect_task_runtime_seconds(run_dir)
+    rows = [
+        {
+            "id": result.task_id,
+            "runtime": _format_hhmmss(
+                runtime_by_task.get(task_key(result.task_id), 0.0)
+            ),
         }
         for result in ordered_results
     ]

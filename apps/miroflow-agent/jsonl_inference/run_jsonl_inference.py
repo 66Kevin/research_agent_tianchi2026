@@ -37,6 +37,7 @@ from jsonl_inference.task_log_recovery import (
     write_blocked_tasks_jsonl,
     write_benchmark_results_jsonl,
     write_final_answers_jsonl,
+    write_task_runtimes_jsonl,
 )
 from src.logging.summary_time_cost import generate_summary
 
@@ -283,6 +284,14 @@ class JSONLInferenceRunner:
         print(f"Final answers saved to {output_path}")
         return str(output_path)
 
+    def _save_task_runtimes_jsonl(
+        self, output_file: str, ordered_results: List[BenchmarkResult], run_dir: Path
+    ) -> str:
+        output_path = Path(output_file)
+        write_task_runtimes_jsonl(output_path, ordered_results, run_dir)
+        print(f"Task runtimes saved to {output_path}")
+        return str(output_path)
+
     def _load_existing_benchmark_results(
         self, input_file: Path
     ) -> Dict[str, BenchmarkResult]:
@@ -304,12 +313,16 @@ class JSONLInferenceRunner:
         results_by_key: Dict[str, BenchmarkResult],
         benchmark_results_path: Path,
         final_answers_path: Path,
+        task_runtimes_path: Path,
         blocked_tasks_path: Path,
     ) -> None:
         ordered_results = self._build_ordered_results(task_order, results_by_key)
         self.evaluator.results = ordered_results
         self._save_benchmark_results_jsonl(str(benchmark_results_path), ordered_results)
         self._save_final_answers_jsonl(str(final_answers_path), ordered_results)
+        self._save_task_runtimes_jsonl(
+            str(task_runtimes_path), ordered_results, benchmark_results_path.parent
+        )
         write_blocked_tasks_jsonl(blocked_tasks_path, ordered_results)
 
     def run_inference(self) -> Dict[str, str]:
@@ -326,6 +339,7 @@ class JSONLInferenceRunner:
         log_dir = self.evaluator.get_log_dir()
         benchmark_results_path = log_dir / "benchmark_results.jsonl"    
         final_answers_path = log_dir / "final_answers.jsonl"
+        task_runtimes_path = log_dir / "task_runtimes.jsonl"
         blocked_tasks_path = log_dir / "blocked_tasks.jsonl"
         summary_path = log_dir / "summary_time_cost.json"
 
@@ -356,6 +370,7 @@ class JSONLInferenceRunner:
                 results_by_key,
                 benchmark_results_path,
                 final_answers_path,
+                task_runtimes_path,
                 blocked_tasks_path,
             )
 
@@ -375,6 +390,7 @@ class JSONLInferenceRunner:
             return {
                 "benchmark_results": str(benchmark_results_path),
                 "final_answers": str(final_answers_path),
+                "task_runtimes": str(task_runtimes_path),
                 "blocked_tasks": str(blocked_tasks_path),
                 "summary_time_cost": str(summary_path),
             }
@@ -392,6 +408,7 @@ class JSONLInferenceRunner:
                 results_by_key,
                 benchmark_results_path,
                 final_answers_path,
+                task_runtimes_path,
                 blocked_tasks_path,
             )
             print(
@@ -412,6 +429,7 @@ class JSONLInferenceRunner:
             results_by_key,
             benchmark_results_path,
             final_answers_path,
+            task_runtimes_path,
             blocked_tasks_path,
         )
 
@@ -420,12 +438,14 @@ class JSONLInferenceRunner:
         print("\nInference completed successfully!")
         print(f"  benchmark_results: {benchmark_results_path}")
         print(f"  final_answers: {final_answers_path}")
+        print(f"  task_runtimes: {task_runtimes_path}")
         print(f"  blocked_tasks: {blocked_tasks_path}")
         print(f"  summary: {summary_path}")
 
         return {
             "benchmark_results": str(benchmark_results_path),
             "final_answers": str(final_answers_path),
+            "task_runtimes": str(task_runtimes_path),
             "blocked_tasks": str(blocked_tasks_path),
             "summary_time_cost": str(summary_path),
         }

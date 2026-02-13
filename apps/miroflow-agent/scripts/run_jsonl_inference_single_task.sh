@@ -116,6 +116,7 @@ uv run python jsonl_inference/run_jsonl_inference.py \
 
 FINAL_ANSWERS_FILE="${RESULTS_DIR}/final_answers.jsonl"
 BENCHMARK_RESULTS_FILE="${RESULTS_DIR}/benchmark_results.jsonl"
+TASK_RUNTIMES_FILE="${RESULTS_DIR}/task_runtimes.jsonl"
 SUMMARY_FILE="${RESULTS_DIR}/summary_time_cost.json"
 BLOCKED_TASKS_FILE="${RESULTS_DIR}/blocked_tasks.jsonl"
 
@@ -125,8 +126,8 @@ echo "task_id: ${TASK_ID_INPUT}"
 echo "single-task input: ${FILTERED_INPUT_JSONL}"
 echo "final_answers.jsonl: ${FINAL_ANSWERS_FILE}"
 echo "benchmark_results.jsonl: ${BENCHMARK_RESULTS_FILE}"
+echo "task_runtimes.jsonl: ${TASK_RUNTIMES_FILE}"
 echo "blocked_tasks.jsonl: ${BLOCKED_TASKS_FILE}"
 echo "summary_time_cost.json: ${SUMMARY_FILE}"
 echo "run output log: ${RUN_OUTPUT_LOG}"
 echo "=========================================="
-

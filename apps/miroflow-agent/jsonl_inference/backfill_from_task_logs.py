@@ -23,6 +23,7 @@ from jsonl_inference.task_log_recovery import (
     task_key,
     write_benchmark_results_jsonl,
     write_final_answers_jsonl,
+    write_task_runtimes_jsonl,
 )
 
 
@@ -47,6 +48,11 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Path to final_answers.jsonl (default: <run-dir>/final_answers.jsonl)",
     )
+    parser.add_argument(
+        "--task-runtimes-out",
+        default=None,
+        help="Path to task_runtimes.jsonl (default: <run-dir>/task_runtimes.jsonl)",
+    )
     return parser.parse_args()
 
 
@@ -68,6 +74,11 @@ def main() -> None:
         Path(args.final_answers_out).resolve()
         if args.final_answers_out
         else run_dir / "final_answers.jsonl"
+    )
+    task_runtimes_out = (
+        Path(args.task_runtimes_out).resolve()
+        if args.task_runtimes_out
+        else run_dir / "task_runtimes.jsonl"
     )
 
     tasks = load_tasks_from_jsonl(
@@ -92,6 +103,7 @@ def main() -> None:
     ordered_results = build_ordered_results(task_order, merged_results)
     write_benchmark_results_jsonl(benchmark_results_out, ordered_results)
     write_final_answers_jsonl(final_answers_out, ordered_results)
+    write_task_runtimes_jsonl(task_runtimes_out, ordered_results, run_dir)
 
     print("Backfill completed.")
     print(f"Run directory: {run_dir}")
@@ -103,6 +115,7 @@ def main() -> None:
     print(f"Pending tasks after backfill: {len(tasks) - len(ordered_results)}")
     print(f"benchmark_results.jsonl: {benchmark_results_out}")
     print(f"final_answers.jsonl: {final_answers_out}")
+    print(f"task_runtimes.jsonl: {task_runtimes_out}")
 
 
 if __name__ == "__main__":
