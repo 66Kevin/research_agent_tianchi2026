@@ -1,6 +1,6 @@
 # Deep Research Agent for Tianchi2026 Challenge
 
-## Experiments
+## Tricks
 ### Done
 **Prompt优化：**
 - WIP...
@@ -23,7 +23,7 @@
 - tool calling优化：什么时候用google，什么时候用国内搜索api，fallback机制/策略
 
 
-Experiments:
+## Experiments
 
 | # | Model         | Tool(s)                      | Score  | Comment |
 |---|---------------|------------------------------|--------|---------|
