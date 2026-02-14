@@ -21,3 +21,17 @@
 - 时间限制优化：限制10min内，时间优化（越短越好）
 - Ensemble策略：运行多次进行ensemble，但是要考虑时间问题！！
 - tool calling优化：什么时候用google，什么时候用国内搜索api，fallback机制/策略
+
+
+Experiments:
+
+| # | Model         | Tool(s)                      | Score  | Comment |
+|---|---------------|------------------------------|--------|---------|
+| 1 | deepseek-chat | google-search, jina scrape   | 0.6162 |         |
+| 2 | qwen3-max     | None                         | 0.2929 |         |
+| 3 | qwen3-max     | google-search                | 0.3535 |         |
+
+Log Path：
+1. logs/gaia-validation/deepseek_deepseek-chat_mirothinker_v1.5_keep5_max200/run_20260206_110146
+2. logs/tianchi-validation/qwen_qwen3-max_mirothinker_v1.5_keep5_max200
+3. logs/tianchi-validation/qwen_qwen3-max_mirothinker_v1.5_keep5_max200_tianchi
