@@ -1,0 +1,16 @@
+# conf/agent/mirothinker_v1.5_search_only_keep5_max200.yaml
+defaults:
+  - default
+  - _self_
+
+main_agent:
+  tools:
+    - search_and_scrape_webpage
+  tool_blacklist:
+    - [ "search_and_scrape_webpage", "sogou_search" ]
+  max_turns: 200
+
+sub_agents:
+
+keep_tool_result: 5
+context_compress_limit: 5

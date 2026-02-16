@@ -25,13 +25,19 @@
 
 ## Experiments
 
-| # | Model         | Tool(s)                      | Score  | Comment |
-|---|---------------|------------------------------|--------|---------|
-| 1 | deepseek-chat | google-search, jina scrape   | 0.6162 |         |
-| 2 | qwen3-max     | None                         | 0.2929 |         |
-| 3 | qwen3-max     | google-search                | 0.3535 |         |
+| # | Model         | Tool(s)                     | Score  | Improvement | Comment |
+|---|---------------|-----------------------------|--------|-------------|---------|
+| 1 | deepseek-chat | google-search, jina scrape  | 0.6162 | -           |         |
+| 2 | qwen3-max     | None                        | 0.2929 | -           |         |
+| 3 | qwen3-max     | google-search               | 0.3535 | -           |         |
+| 4 | qwen3-max     | google-search (search-only) | 0.5051 | search-only tool policy (blacklist sogou_search); MCP tool-call parsing hardening (`_normalize_mcp_name` + malformed `<use_mcp_tool>` fallback); qwen `enable_thinking` + reasoning log | local run, 97/100 completed (last 3 manually stopped) |
 
 Log Path：
 1. logs/gaia-validation/deepseek_deepseek-chat_mirothinker_v1.5_keep5_max200/run_20260206_110146
 2. logs/tianchi-validation/qwen_qwen3-max_mirothinker_v1.5_keep5_max200
 3. logs/tianchi-validation/qwen_qwen3-max_mirothinker_v1.5_keep5_max200_tianchi
+4. apps/miroflow-agent/logs/tianchi-validation/qwen_qwen3-max_mirothinker_v1.5_search_only_keep5_max200/fg_full_probe_20260216_154936
+
+Run Note:
+- local run completed 97 tasks before manual stop
+- average runtime from task_runtimes.jsonl: 00:17:44

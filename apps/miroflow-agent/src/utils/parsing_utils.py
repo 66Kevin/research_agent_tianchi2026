@@ -21,6 +21,24 @@ from json_repair import repair_json
 logger = logging.getLogger("miroflow_agent")
 
 
+def _normalize_mcp_name(name: str) -> str:
+    """
+    Normalize server/tool names extracted from free-form MCP XML-like text.
+
+    Qwen occasionally emits malformed names like `google_search</`.
+    This helper keeps only the canonical identifier part.
+    """
+    if not isinstance(name, str):
+        return str(name)
+
+    normalized = name.strip().strip("`'\"")
+    # Remove accidentally generated XML fragments or trailing tag starters
+    normalized = normalized.split("<", 1)[0].strip()
+    # Remove trailing punctuation commonly seen in malformed generations
+    normalized = normalized.rstrip("/> \t\r\n")
+    return normalized
+
+
 def filter_none_values(arguments: Union[Dict, Any]) -> Union[Dict, Any]:
     """
     Filter out keys with None values from arguments dictionary.
@@ -237,6 +255,8 @@ def parse_llm_response_for_tool_calls(
                 else:
                     server_name = "unknown"
                     tool_name = name
+                server_name = _normalize_mcp_name(server_name)
+                tool_name = _normalize_mcp_name(tool_name)
                 arguments_str = item.get("arguments")
                 arguments = safe_json_loads(arguments_str)
                 arguments = filter_none_values(arguments)
@@ -260,6 +280,8 @@ def parse_llm_response_for_tool_calls(
             else:
                 server_name = "unknown"
                 tool_name = name
+            server_name = _normalize_mcp_name(server_name)
+            tool_name = _normalize_mcp_name(tool_name)
             arguments_str = tool_call.function.arguments
 
             # Parse JSON string to dictionary
@@ -313,8 +335,8 @@ def parse_llm_response_for_tool_calls(
     )
 
     for match in tool_call_patterns:
-        server_name = match[0].strip()
-        tool_name = match[1].strip()
+        server_name = _normalize_mcp_name(match[0])
+        tool_name = _normalize_mcp_name(match[1])
         arguments_str = match[2].strip()
 
         # Parse JSON string to dictionary
@@ -329,5 +351,48 @@ def parse_llm_response_for_tool_calls(
                 "id": None,
             }
         )
+
+    # Fallback parser for malformed MCP blocks (common with some qwen outputs):
+    # - missing </use_mcp_tool>
+    # - extra characters around tool_name like `google_search</`
+    if not tool_calls and "<use_mcp_tool>" in llm_response_content_text:
+        block_patterns = re.findall(
+            r"<use_mcp_tool>([\s\S]*?)(?:</use_mcp_tool>|$)",
+            llm_response_content_text,
+            re.DOTALL,
+        )
+
+        for block in block_patterns:
+            server_match = re.search(
+                r"<server_name>([\s\S]*?)(?:</server_name>|$)", block, re.DOTALL
+            )
+            tool_match = re.search(
+                r"<tool_name>([\s\S]*?)(?:</tool_name>|$)", block, re.DOTALL
+            )
+            args_match = re.search(
+                r"<arguments>\s*([\s\S]*?)\s*(?:</arguments>|$)", block, re.DOTALL
+            )
+
+            if not (server_match and tool_match and args_match):
+                continue
+
+            server_name = _normalize_mcp_name(server_match.group(1))
+            tool_name = _normalize_mcp_name(tool_match.group(1))
+            arguments_str = args_match.group(1).strip()
+
+            if not server_name or not tool_name:
+                continue
+
+            arguments = safe_json_loads(arguments_str)
+            arguments = filter_none_values(arguments)
+
+            tool_calls.append(
+                {
+                    "server_name": server_name,
+                    "tool_name": tool_name,
+                    "arguments": arguments,
+                    "id": None,
+                }
+            )
 
     return tool_calls

@@ -165,6 +165,9 @@ class OpenAIClient(BaseClient):
             if "deepseek-v3-1" in self.model_name:
                 params["extra_body"]["thinking"] = {"type": "enabled"}
 
+            if "qwen3" in self.model_name or "qwen-max" in self.model_name:
+                params["extra_body"]["enable_thinking"] = True
+
             # auto-detect if we need to continue from the last assistant message
             if messages_for_llm and messages_for_llm[-1].get("role") == "assistant":
                 params["extra_body"]["continue_final_message"] = True
@@ -315,6 +318,14 @@ class OpenAIClient(BaseClient):
         # Extract LLM response text
         if llm_response.choices[0].finish_reason == "stop":
             assistant_response_text = llm_response.choices[0].message.content or ""
+            reasoning_content = getattr(llm_response.choices[0].message, "reasoning_content", None)
+
+            if reasoning_content:
+                self.task_log.log_step(
+                    "info",
+                    "LLM | Thinking Process",
+                    reasoning_content,
+                )
 
             message_history.append(
                 {"role": "assistant", "content": assistant_response_text}
