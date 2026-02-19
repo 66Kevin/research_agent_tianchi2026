@@ -3,6 +3,7 @@
 
 import json
 from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
 
 from .task_logger import logger
@@ -79,6 +80,21 @@ def _calculate_averages(summary_block):
     summary_block["tool_workload_breakdown"].update(avg_tool_workload)
 
 
+def _extract_wall_time_seconds(result):
+    """Best-effort wall-time extraction from task log timestamps."""
+    start_time = result.get("start_time")
+    end_time = result.get("end_time")
+    if not start_time or not end_time:
+        return 0.0
+
+    try:
+        start_dt = datetime.strptime(start_time, "%Y-%m-%d %H:%M:%S")
+        end_dt = datetime.strptime(end_time, "%Y-%m-%d %H:%M:%S")
+        return max(0.0, (end_dt - start_dt).total_seconds())
+    except Exception:
+        return 0.0
+
+
 def generate_summary(log_dir: Path):
     """
     Generates a summary of benchmark results by reading log files from a directory,
@@ -91,7 +107,7 @@ def generate_summary(log_dir: Path):
     """
     results = []
     for log_file in log_dir.glob("*.json"):
-        if log_file.name == "summary.json":
+        if log_file.name in {"summary.json", "summary_time_cost.json"}:
             continue
         try:
             with open(log_file, "r", encoding="utf-8") as f:
@@ -105,12 +121,14 @@ def generate_summary(log_dir: Path):
     summary_by_judge = defaultdict(_get_summary_template)
 
     for result in results:
-        trace_data = result.get("trace_data")
-        if not trace_data or "performance_summary" not in trace_data:
-            continue
-
-        perf_summary = trace_data["performance_summary"]
+        trace_data = result.get("trace_data") or {}
+        perf_summary = trace_data.get("performance_summary")
         tool_workload = trace_data.get("tool_workload_breakdown", {})
+        if not perf_summary:
+            fallback_wall_time = _extract_wall_time_seconds(result)
+            if fallback_wall_time <= 0 and not tool_workload:
+                continue
+            perf_summary = {"total_wall_time": fallback_wall_time}
 
         # Update overall summary
         _update_summary_data(overall_summary, perf_summary, tool_workload)

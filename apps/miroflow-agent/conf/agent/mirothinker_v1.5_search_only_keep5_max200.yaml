@@ -9,6 +9,17 @@ main_agent:
   tool_blacklist:
     - [ "search_and_scrape_webpage", "sogou_search" ]
   max_turns: 200
+  web_tool_call_hard_limit: 10
+  system_prompt_skill: |
+    Tianchi stage-1 web QA efficiency skill:
+    - Before any tool call, extract the expected answer type, language, and exact output format from the question.
+    - Use targeted queries, not broad paraphrases. Each new query must introduce new constraints (entity, year, location, source, or relation).
+    - Default search budget is <= 6 calls. Hard limit is 10 calls. If the budget is nearly exhausted, stop searching and return the best-supported candidate.
+    - Treat near-duplicate query rewrites as mistakes and avoid repeated semantic searches.
+    - Stop early when evidence is sufficient:
+      - one authoritative source that directly states the answer; or
+      - two independent sources that agree with no contradiction.
+    - Prefer official or primary sources when available, and focus only on facts needed for the final short answer.
 
 sub_agents:
 

@@ -77,10 +77,37 @@ def _task_worker(task_dict, cfg_dict, evaluator_kwargs):
 
     loop.set_exception_handler(exception_handler)
 
+    task_timeout_seconds = (
+        cfg.benchmark.execution.get("task_timeout_seconds", None)
+        if "benchmark" in cfg and "execution" in cfg.benchmark
+        else None
+    )
+
     try:
-        result = loop.run_until_complete(evaluator.run_single_task(task))
+        if task_timeout_seconds and float(task_timeout_seconds) > 0:
+            result = loop.run_until_complete(
+                asyncio.wait_for(
+                    evaluator.run_single_task(task),
+                    timeout=float(task_timeout_seconds),
+                )
+            )
+        else:
+            result = loop.run_until_complete(evaluator.run_single_task(task))
         # Convert result to dict for serialization
         return asdict(result)
+    except asyncio.TimeoutError:
+        timeout_s = int(float(task_timeout_seconds)) if task_timeout_seconds else 0
+        timeout_result = BenchmarkResult(
+            task_id=task.task_id,
+            task_question=task.task_question,
+            ground_truth=task.ground_truth,
+            file_path=task.file_path,
+            model_boxed_answer="",
+            status="failed",
+            metadata=task.metadata.copy(),
+            error_message=f"Task timed out after {timeout_s} seconds",
+        )
+        return asdict(timeout_result)
     finally:
         loop.close()
 

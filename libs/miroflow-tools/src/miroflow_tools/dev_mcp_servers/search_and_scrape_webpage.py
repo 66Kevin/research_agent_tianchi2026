@@ -2,7 +2,6 @@
 # This source code is licensed under the MIT License.
 
 import json
-import logging
 import os
 from typing import Any, Dict
 
@@ -23,9 +22,6 @@ from tencentcloud.common.profile.client_profile import ClientProfile
 from tencentcloud.common.profile.http_profile import HttpProfile
 
 from ..mcp_servers.utils.url_unquote import decode_http_urls_in_dict
-
-# Configure logging
-logger = logging.getLogger("miroflow")
 
 SERPER_BASE_URL = os.getenv("SERPER_BASE_URL", "https://google.serper.dev")
 SERPER_API_KEY = os.getenv("SERPER_API_KEY", "")
@@ -81,10 +77,9 @@ async def google_search(
     autocorrect: bool = None,
 ):
     """
-    Tool to perform web searches via Serper API and retrieve rich results.
+    Tool to perform web searches and retrieve rich results.
 
-    It is able to retrieve organic search results, people also ask,
-    related searches, and knowledge graph.
+    Uses Serper API for web search.
 
     Args:
         q: Search query string
@@ -99,23 +94,23 @@ async def google_search(
     Returns:
         Dictionary containing search results and metadata.
     """
-    # Check for API key
-    if not SERPER_API_KEY:
-        return json.dumps(
-            {
-                "success": False,
-                "error": "SERPER_API_KEY environment variable not set",
-                "results": [],
-            },
-            ensure_ascii=False,
-        )
-
     # Validate required parameter
     if not q or not q.strip():
         return json.dumps(
             {
                 "success": False,
                 "error": "Search query 'q' is required and cannot be empty",
+                "results": [],
+            },
+            ensure_ascii=False,
+        )
+
+    # Check for provider credentials
+    if not SERPER_API_KEY:
+        return json.dumps(
+            {
+                "success": False,
+                "error": "SERPER_API_KEY is not set; google_search tool is unavailable",
                 "results": [],
             },
             ensure_ascii=False,

@@ -203,7 +203,9 @@ You accomplish a given task iteratively, breaking it down into clear steps and w
     return template
 
 
-def generate_agent_specific_system_prompt(agent_type=""):
+def generate_agent_specific_system_prompt(
+    agent_type="", extra_instruction: str = ""
+):
     """
     Generate agent-specific objective prompts based on agent type.
 
@@ -213,6 +215,8 @@ def generate_agent_specific_system_prompt(agent_type=""):
 
     Args:
         agent_type: Type of agent ("main", "agent-browsing", or "browsing-agent")
+        extra_instruction: Optional task-specific instruction block appended to
+            the agent objective prompt.
 
     Returns:
         Agent-specific objective prompt string
@@ -232,6 +236,14 @@ Do not infer, speculate, summarize broadly, or attempt to fill in missing parts 
 """
     else:
         raise ValueError(f"Unknown agent type: {agent_type}")
+
+    if extra_instruction:
+        system_prompt = (
+            f"{system_prompt.strip()}\n\n"
+            "# Task-Specific Execution Skill\n\n"
+            f"{extra_instruction.strip()}\n"
+        )
+
     return system_prompt.strip()
 
 

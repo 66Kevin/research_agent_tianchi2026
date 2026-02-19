@@ -489,7 +489,7 @@ class AnswerGenerator:
         | OFF (limit=0)      | No                | Generate answer → fallback to intermediate  |
         | OFF (limit=0)      | Yes               | Generate answer → fallback to intermediate  |
         | ON  (limit>0)      | No                | Generate answer → no fallback, fail summary |
-        | ON  (limit>0)      | Yes               | SKIP generation → fail summary directly     |
+        | ON  (limit>0)      | Yes               | Generate answer → no fallback, fail summary |
 
         Args:
             system_prompt: System prompt for the LLM
@@ -506,10 +506,16 @@ class AnswerGenerator:
         context_management_enabled = self.context_compress_limit > 0
         failure_experience_summary = None
         usage_log = ""
+        force_generate_on_max_turns = bool(
+            self.cfg.agent.get("force_generate_final_answer_on_max_turns", True)
+        )
 
-        # CASE: Context management ON + reached max turns
-        # Skip answer generation entirely - any answer would be a blind guess
-        if context_management_enabled and reached_max_turns:
+        # Optional strict mode: skip final answer generation when max turns reached.
+        if (
+            context_management_enabled
+            and reached_max_turns
+            and not force_generate_on_max_turns
+        ):
             self.task_log.log_step(
                 "info",
                 "Main Agent | Final Answer (Context Management Mode)",
@@ -529,6 +535,12 @@ class AnswerGenerator:
                 failure_experience_summary,
                 usage_log,
                 message_history,
+            )
+        elif context_management_enabled and reached_max_turns:
+            self.task_log.log_step(
+                "warning",
+                "Main Agent | Final Answer (Context Management Mode)",
+                "Reached max turns. Forcing final answer generation from collected evidence.",
             )
 
         # ALL OTHER CASES: Generate final answer first

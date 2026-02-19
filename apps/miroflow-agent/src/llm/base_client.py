@@ -24,7 +24,6 @@ from omegaconf import DictConfig
 
 from ..logging.task_logger import TaskLog
 from .errors import PolicyBlockedError
-from .util import with_timeout
 
 # Default timeout for LLM API calls (10 minutes)
 DEFAULT_LLM_TIMEOUT_SECONDS = 600
@@ -220,7 +219,6 @@ class BaseClient(ABC):
 
         return messages_copy
 
-    @with_timeout(DEFAULT_LLM_TIMEOUT_SECONDS)
     async def create_message(
         self,
         system_prompt: str,
@@ -252,12 +250,19 @@ class BaseClient(ABC):
             Tuple of (response, updated_message_history)
         """
         # Unified LLM call processing
+        timeout_seconds = float(
+            self.cfg.llm.get("timeout_seconds", DEFAULT_LLM_TIMEOUT_SECONDS)
+        )
+
         try:
-            response, message_history = await self._create_message(
-                system_prompt,
-                message_history,
-                tool_definitions,
-                keep_tool_result=keep_tool_result,
+            response, message_history = await asyncio.wait_for(
+                self._create_message(
+                    system_prompt,
+                    message_history,
+                    tool_definitions,
+                    keep_tool_result=keep_tool_result,
+                ),
+                timeout=timeout_seconds,
             )
 
         except PolicyBlockedError:

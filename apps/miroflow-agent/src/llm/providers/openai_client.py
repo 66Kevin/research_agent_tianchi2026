@@ -17,6 +17,7 @@ Features:
 import asyncio
 import dataclasses
 import logging
+from types import SimpleNamespace
 from typing import Any, Dict, List, Tuple, Union
 
 import tiktoken
@@ -31,6 +32,143 @@ logger = logging.getLogger("miroflow_agent")
 
 @dataclasses.dataclass
 class OpenAIClient(BaseClient):
+    @staticmethod
+    def _is_data_inspection_failed_error(error: Exception) -> bool:
+        """Detect provider data-inspection failures that can benefit from context rollback."""
+        error_text = str(error).lower()
+        return (
+            "data_inspection_failed" in error_text
+            or "internalerror.algo.datainspectionfailed" in error_text
+        )
+
+    @staticmethod
+    def _truncate_message_content(content: Any, max_chars: int) -> Any:
+        """Truncate message content while preserving schema shape."""
+        if isinstance(content, str):
+            if len(content) <= max_chars:
+                return content
+            return content[:max_chars] + "\n...[truncated for provider safety retry]"
+
+        if isinstance(content, list):
+            truncated_blocks = []
+            for block in content:
+                if not isinstance(block, dict):
+                    truncated_blocks.append(block)
+                    continue
+                block_copy = dict(block)
+                text_value = block_copy.get("text")
+                if isinstance(text_value, str) and len(text_value) > max_chars:
+                    block_copy["text"] = (
+                        text_value[:max_chars]
+                        + "\n...[truncated for provider safety retry]"
+                    )
+                truncated_blocks.append(block_copy)
+            return truncated_blocks
+
+        return content
+
+    def _rollback_messages_for_data_inspection(
+        self, messages_for_llm: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """
+        Roll back the most recent turn to reduce risky context after data inspection errors.
+        """
+        rolled_back = [m.copy() for m in messages_for_llm]
+
+        # Remove trailing tool-result/user/assistant messages from the latest turn.
+        removed = 0
+        while (
+            rolled_back
+            and removed < 2
+            and rolled_back[-1].get("role") in {"assistant", "user", "tool"}
+        ):
+            rolled_back.pop()
+            removed += 1
+
+        # Keep message list non-empty and clamp long first user content.
+        if not rolled_back:
+            rolled_back = [m.copy() for m in messages_for_llm[:1]]
+
+        for msg in rolled_back:
+            if msg.get("role") == "user":
+                msg["content"] = self._truncate_message_content(
+                    msg.get("content"), max_chars=2000
+                )
+                break
+
+        return rolled_back
+
+    def _minimal_messages_for_data_inspection(
+        self, messages_for_llm: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """
+        Build a minimal safe context for last-chance retry on data inspection failures.
+        """
+        minimal: List[Dict[str, Any]] = []
+
+        # Keep leading system/developer prompt if present.
+        if messages_for_llm and messages_for_llm[0].get("role") in {
+            "system",
+            "developer",
+        }:
+            minimal.append(messages_for_llm[0].copy())
+
+        # Keep first user question (truncated).
+        first_user = next(
+            (m for m in messages_for_llm if m.get("role") == "user"),
+            None,
+        )
+        if first_user is not None:
+            user_copy = first_user.copy()
+            user_copy["content"] = self._truncate_message_content(
+                user_copy.get("content"), max_chars=1200
+            )
+            minimal.append(user_copy)
+
+        return minimal or [m.copy() for m in messages_for_llm[:1]]
+
+    @staticmethod
+    def _build_streamed_response(chunks: List[Any]) -> Any:
+        """Build a response-like object from streaming chunks."""
+        content_parts: List[str] = []
+        reasoning_parts: List[str] = []
+        finish_reason = "stop"
+        usage_data = None
+
+        for chunk in chunks:
+            if getattr(chunk, "usage", None) is not None:
+                usage_data = chunk.usage
+            if not getattr(chunk, "choices", None):
+                continue
+            choice = chunk.choices[0]
+            if getattr(choice, "finish_reason", None):
+                finish_reason = choice.finish_reason
+            delta = getattr(choice, "delta", None)
+            if delta is None:
+                continue
+            delta_content = getattr(delta, "content", None)
+            if delta_content:
+                content_parts.append(delta_content)
+            delta_reasoning = getattr(delta, "reasoning_content", None)
+            if delta_reasoning:
+                reasoning_parts.append(delta_reasoning)
+
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    finish_reason=finish_reason,
+                    message=SimpleNamespace(
+                        role="assistant",
+                        content="".join(content_parts),
+                        reasoning_content="".join(reasoning_parts)
+                        if reasoning_parts
+                        else None,
+                    ),
+                )
+            ],
+            usage=usage_data,
+        )
+
     def _create_client(self) -> Union[AsyncOpenAI, OpenAI]:
         """Create LLM client"""
         http_client_args = {"headers": {"x-upstream-session-id": self.task_id}}
@@ -137,16 +275,22 @@ class OpenAIClient(BaseClient):
         )
 
         # Retry loop with dynamic max_tokens adjustment
-        max_retries = 10
-        base_wait_time = 30
+        max_retries = int(self.cfg.llm.get("max_retries", 10))
+        if max_retries < 1:
+            max_retries = 1
+        base_wait_time = float(self.cfg.llm.get("retry_base_wait_seconds", 30))
+        if base_wait_time < 0:
+            base_wait_time = 0.0
         current_max_tokens = self.max_tokens
+        use_stream = bool(self.cfg.llm.get("stream", False))
+        data_inspection_retry_count = 0
 
         for attempt in range(max_retries):
             params = {
                 "model": self.model_name,
                 "temperature": self.temperature,
                 "messages": messages_for_llm,
-                "stream": False,
+                "stream": use_stream,
                 "top_p": self.top_p,
                 "extra_body": {},
             }
@@ -174,8 +318,18 @@ class OpenAIClient(BaseClient):
                 params["extra_body"]["add_generation_prompt"] = False
 
             try:
-                if self.async_client:
+                if self.async_client and use_stream:
+                    stream = await self.client.chat.completions.create(**params)
+                    chunks = []
+                    async for chunk in stream:
+                        chunks.append(chunk)
+                    response = self._build_streamed_response(chunks)
+                elif self.async_client:
                     response = await self.client.chat.completions.create(**params)
+                elif use_stream:
+                    stream = self.client.chat.completions.create(**params)
+                    chunks = [chunk for chunk in stream]
+                    response = self._build_streamed_response(chunks)
                 else:
                     response = self.client.chat.completions.create(**params)
                 # Update token count
@@ -276,6 +430,47 @@ class OpenAIClient(BaseClient):
                         blocked_reason,
                     )
                     raise PolicyBlockedError(blocked_reason) from e
+
+                if self._is_data_inspection_failed_error(e):
+                    data_inspection_retry_count += 1
+
+                    if attempt < max_retries - 1:
+                        if data_inspection_retry_count == 1:
+                            previous_len = len(messages_for_llm)
+                            messages_for_llm = self._rollback_messages_for_data_inspection(
+                                messages_for_llm
+                            )
+                            self.task_log.log_step(
+                                "warning",
+                                "LLM | Data Inspection Failed",
+                                (
+                                    "Data inspection failed; rolled back recent turn and retrying "
+                                    f"(attempt {attempt + 1}/{max_retries}, messages {previous_len}->{len(messages_for_llm)})."
+                                ),
+                            )
+                            continue
+
+                        if data_inspection_retry_count == 2:
+                            previous_len = len(messages_for_llm)
+                            messages_for_llm = self._minimal_messages_for_data_inspection(
+                                messages_for_llm
+                            )
+                            self.task_log.log_step(
+                                "warning",
+                                "LLM | Data Inspection Failed",
+                                (
+                                    "Data inspection failed again; switched to minimal context and retrying "
+                                    f"(attempt {attempt + 1}/{max_retries}, messages {previous_len}->{len(messages_for_llm)})."
+                                ),
+                            )
+                            continue
+
+                    self.task_log.log_step(
+                        "error",
+                        "LLM | Data Inspection Failed",
+                        f"Persistent data inspection failure after {attempt + 1} attempts: {str(e)}",
+                    )
+                    raise e
 
                 if "Error code: 400" in str(e) and "longer than the model" in str(e):
                     self.task_log.log_step(

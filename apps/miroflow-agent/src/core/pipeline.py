@@ -12,6 +12,7 @@ The pipeline orchestrates the interaction between LLM clients, tool managers,
 and the orchestrator to execute complex multi-turn agent tasks.
 """
 
+import asyncio
 import traceback
 import uuid
 from typing import Any, Dict, List, Optional
@@ -92,6 +93,7 @@ async def execute_task_pipeline(
         for sub_agent_tool_manager in sub_agent_tool_managers.values():
             sub_agent_tool_manager.set_task_log(task_log)
 
+    llm_client = None
     try:
         # Initialize LLM client
         random_uuid = str(uuid.uuid4())
@@ -121,8 +123,6 @@ async def execute_task_pipeline(
             task_id=task_id,
         )
 
-        llm_client.close()
-
         task_log.final_boxed_answer = final_boxed_answer
         task_status = getattr(orchestrator, "task_status", "success")
         blocked_reason = getattr(orchestrator, "blocked_reason", None)
@@ -150,6 +150,24 @@ async def execute_task_pipeline(
             failure_experience_summary,
         )
 
+    except asyncio.CancelledError as e:
+        task_log.log_step(
+            "warning",
+            "task_cancelled",
+            f"Task {task_id} was cancelled, likely due to timeout.",
+        )
+        task_log.log_step(
+            "error",
+            "task_cancelled_details",
+            traceback.format_exc(),
+        )
+        task_log.status = "failed"
+        task_log.error = f"CancelledError: {str(e) or 'Task execution cancelled'}"
+        task_log.trace_data["cancelled"] = True
+        task_log.trace_data["cancelled_reason"] = str(e) or "timeout_or_cancelled"
+        task_log.save()
+        raise
+
     except Exception as e:
         error_details = traceback.format_exc()
         task_log.log_step(
@@ -175,6 +193,9 @@ async def execute_task_pipeline(
         return error_message, "", log_file_path, None
 
     finally:
+        if llm_client is not None:
+            llm_client.close()
+
         task_log.end_time = get_utc_plus_8_time()
 
         # Record task summary to structured log

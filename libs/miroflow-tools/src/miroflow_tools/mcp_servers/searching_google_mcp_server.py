@@ -107,9 +107,7 @@ async def google_search(
         The search results.
     """
     if SERPER_API_KEY == "":
-        return (
-            "[ERROR]: SERPER_API_KEY is not set, google_search tool is not available."
-        )
+        return "[ERROR]: SERPER_API_KEY is not set, google_search tool is not available."
 
     tool_name = "google_search"
     arguments = {
@@ -127,7 +125,10 @@ async def google_search(
     server_params = StdioServerParameters(
         command=sys.executable,
         args=["-m", "miroflow_tools.mcp_servers.serper_mcp_server"],
-        env={"SERPER_API_KEY": SERPER_API_KEY, "SERPER_BASE_URL": SERPER_BASE_URL},
+        env={
+            "SERPER_API_KEY": SERPER_API_KEY,
+            "SERPER_BASE_URL": SERPER_BASE_URL,
+        },
     )
     result_content = ""
 

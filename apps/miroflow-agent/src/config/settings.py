@@ -90,9 +90,7 @@ def create_mcp_server_parameters(cfg: DictConfig, agent_cfg: DictConfig):
         and "tool-google-search" in agent_cfg["tools"]
     ):
         if not SERPER_API_KEY:
-            raise ValueError(
-                "SERPER_API_KEY not set, tool-google-search will be unavailable."
-            )
+            raise ValueError("SERPER_API_KEY is not set, tool-google-search is unavailable.")
 
         configs.append(
             {

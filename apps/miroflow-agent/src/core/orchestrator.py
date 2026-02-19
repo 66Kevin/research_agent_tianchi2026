@@ -15,7 +15,7 @@ import time
 import uuid
 from collections import defaultdict
 from datetime import date
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from miroflow_tools.manager import ToolManager
 from omegaconf import DictConfig
@@ -53,6 +53,9 @@ DEFAULT_MAX_CONSECUTIVE_ROLLBACKS = 5
 
 # Additional attempts beyond max_turns for total loop protection
 EXTRA_ATTEMPTS_BUFFER = 200
+
+# Hard limit for budgeted web tool calls. Set to 0 to disable.
+DEFAULT_WEB_TOOL_CALL_HARD_LIMIT = 0
 
 
 def _list_tools(sub_agent_tool_managers: Dict[str, ToolManager]):
@@ -149,6 +152,15 @@ class Orchestrator:
 
         # Context management settings
         self.context_compress_limit = cfg.agent.get("context_compress_limit", 0)
+        try:
+            self.web_tool_call_hard_limit = int(
+                self.cfg.agent.main_agent.get(
+                    "web_tool_call_hard_limit", DEFAULT_WEB_TOOL_CALL_HARD_LIMIT
+                )
+                or 0
+            )
+        except (TypeError, ValueError):
+            self.web_tool_call_hard_limit = DEFAULT_WEB_TOOL_CALL_HARD_LIMIT
         self.task_status = "running"
         self.blocked_reason: Optional[str] = None
         self.current_agent_id: Optional[str] = None
@@ -342,14 +354,14 @@ class Orchestrator:
         if count > 0:
             if consecutive_rollbacks < self.MAX_CONSECUTIVE_ROLLBACKS - 1:
                 message_history.pop()
-                turn_count -= 1
                 consecutive_rollbacks += 1
                 self.task_log.log_step(
                     "warning",
                     f"{agent_name} | Turn: {turn_count} | Rollback",
                     f"Duplicate query detected - tool: {tool_name}, query: '{query_str}', "
                     f"previous count: {count}. Consecutive rollbacks: {consecutive_rollbacks}/"
-                    f"{self.MAX_CONSECUTIVE_ROLLBACKS}, Total attempts: {total_attempts}/{max_attempts}",
+                    f"{self.MAX_CONSECUTIVE_ROLLBACKS}, Total attempts: {total_attempts}/{max_attempts}. "
+                    "Current turn budget is consumed to avoid infinite duplicate loops.",
                 )
                 return True, True, turn_count, consecutive_rollbacks, message_history
             else:
@@ -370,6 +382,110 @@ class Orchestrator:
         if query_str:
             self.used_queries.setdefault(cache_name, defaultdict(int))
             self.used_queries[cache_name][query_str] += 1
+
+    @staticmethod
+    def _build_tool_index(
+        tool_definitions: Optional[List[Dict[str, Any]]],
+    ) -> Dict[str, Set[str]]:
+        """Build {server_name: {tool_name}} for fast tool-routing validation."""
+        index: Dict[str, Set[str]] = {}
+        if not tool_definitions:
+            return index
+        for server in tool_definitions:
+            server_name = server.get("name")
+            if not server_name:
+                continue
+            for tool in server.get("tools", []) or []:
+                tool_name = tool.get("name")
+                if tool_name:
+                    index.setdefault(server_name, set()).add(tool_name)
+        return index
+
+    @staticmethod
+    def _build_tool_to_server_index(
+        tool_index: Dict[str, Set[str]],
+    ) -> Dict[str, Set[str]]:
+        """Build reverse index {tool_name: {server_name}} from tool index."""
+        tool_to_server: Dict[str, Set[str]] = {}
+        for server_name, tools in tool_index.items():
+            for tool_name in tools:
+                tool_to_server.setdefault(tool_name, set()).add(server_name)
+        return tool_to_server
+
+    def _repair_tool_call_routing(
+        self,
+        server_name: str,
+        tool_name: str,
+        tool_index: Dict[str, Set[str]],
+        tool_to_server_index: Dict[str, Set[str]],
+    ) -> Tuple[str, str, Optional[str]]:
+        """
+        Attempt lightweight auto-repair for common server/tool routing mistakes.
+        """
+        if not tool_index:
+            return server_name, tool_name, None
+
+        if tool_name in tool_index.get(server_name, set()):
+            return server_name, tool_name, None
+
+        # Case 1: server/tool accidentally swapped.
+        if tool_name in tool_index and server_name in tool_index.get(tool_name, set()):
+            return (
+                tool_name,
+                server_name,
+                "swapped server_name/tool_name",
+            )
+
+        # Case 2: tool name is valid and maps to exactly one server.
+        candidate_servers = tool_to_server_index.get(tool_name, set())
+        if len(candidate_servers) == 1:
+            repaired_server = next(iter(candidate_servers))
+            if repaired_server != server_name:
+                return (
+                    repaired_server,
+                    tool_name,
+                    f"remapped server_name '{server_name}' -> '{repaired_server}' by unique tool ownership",
+                )
+
+        return server_name, tool_name, None
+
+    def _validate_tool_call(
+        self,
+        server_name: str,
+        tool_name: str,
+        tool_index: Dict[str, Set[str]],
+    ) -> Tuple[bool, str]:
+        """
+        Validate tool routing using currently available tool definitions.
+        """
+        if not tool_index:
+            return True, ""
+
+        available_tools = tool_index.get(server_name)
+        if not available_tools:
+            return False, f"server '{server_name}' is not available"
+
+        if tool_name not in available_tools:
+            return (
+                False,
+                f"tool '{tool_name}' is not available on server '{server_name}'",
+            )
+
+        return True, ""
+
+    @staticmethod
+    def _is_budgeted_web_tool(tool_name: str) -> bool:
+        """
+        Identify tool calls that should count toward web search budget.
+        """
+        return tool_name in {
+            "google_search",
+            "sogou_search",
+            "search_and_browse",
+            "scrape",
+            "scrape_website",
+            "scrape_and_extract_info",
+        }
 
     async def run_sub_agent(
         self,
@@ -417,12 +533,23 @@ class Orchestrator:
                 f"{sub_agent_name} | No Tools",
                 "No tool definitions available.",
             )
+        tool_index = self._build_tool_index(tool_definitions)
+        tool_to_server_index = self._build_tool_to_server_index(tool_index)
 
         # Generate sub-agent system prompt
+        sub_agent_extra_instruction = ""
+        if self.cfg.agent.sub_agents and sub_agent_name in self.cfg.agent.sub_agents:
+            sub_agent_extra_instruction = self.cfg.agent.sub_agents[sub_agent_name].get(
+                "system_prompt_skill", ""
+            )
+
         system_prompt = self.llm_client.generate_agent_system_prompt(
             date=date.today(),
             mcp_servers=tool_definitions,
-        ) + generate_agent_specific_system_prompt(agent_type=sub_agent_name)
+        ) + generate_agent_specific_system_prompt(
+            agent_type=sub_agent_name,
+            extra_instruction=sub_agent_extra_instruction,
+        )
 
         # Limit sub-agent turns
         if self.cfg.agent.sub_agents:
@@ -433,6 +560,7 @@ class Orchestrator:
         total_attempts = 0
         max_attempts = max_turns + EXTRA_ATTEMPTS_BUFFER
         consecutive_rollbacks = 0
+        web_tool_calls = 0
 
         while turn_count < max_turns and total_attempts < max_attempts:
             turn_count += 1
@@ -532,6 +660,7 @@ class Orchestrator:
             tool_calls_data = []
             all_tool_results_content_with_id = []
             should_rollback_turn = False
+            force_end_loop = False
 
             for call in tool_calls:
                 server_name = call["server_name"]
@@ -539,10 +668,72 @@ class Orchestrator:
                 arguments = call["arguments"]
                 call_id = call["id"]
 
+                repaired_server_name, repaired_tool_name, repair_reason = (
+                    self._repair_tool_call_routing(
+                        server_name=server_name,
+                        tool_name=tool_name,
+                        tool_index=tool_index,
+                        tool_to_server_index=tool_to_server_index,
+                    )
+                )
+                if repair_reason:
+                    self.task_log.log_step(
+                        "info",
+                        f"{sub_agent_name} | Turn: {turn_count} | Tool Routing Repaired",
+                        (
+                            f"Auto-repaired routing ({repair_reason}): "
+                            f"{server_name}/{tool_name} -> {repaired_server_name}/{repaired_tool_name}"
+                        ),
+                    )
+                    server_name = repaired_server_name
+                    tool_name = repaired_tool_name
+
                 # Fix common parameter name mistakes
                 arguments = self.tool_executor.fix_tool_call_arguments(
                     tool_name, arguments
                 )
+
+                # Validate server/tool routing before execution.
+                is_valid, validation_error = self._validate_tool_call(
+                    server_name, tool_name, tool_index
+                )
+                if not is_valid:
+                    if consecutive_rollbacks < self.MAX_CONSECUTIVE_ROLLBACKS - 1:
+                        if message_history and message_history[-1]["role"] == "assistant":
+                            message_history.pop()
+                        consecutive_rollbacks += 1
+                        should_rollback_turn = True
+                        self.task_log.log_step(
+                            "warning",
+                            f"{sub_agent_name} | Turn: {turn_count} | Rollback",
+                            f"Invalid tool routing: {validation_error}. "
+                            f"Consecutive rollbacks: {consecutive_rollbacks}/{self.MAX_CONSECUTIVE_ROLLBACKS}",
+                        )
+                        break
+                    self.task_log.log_step(
+                        "warning",
+                        f"{sub_agent_name} | Turn: {turn_count} | End After Max Rollbacks",
+                        f"Ending loop after repeated invalid tool routing: {validation_error}",
+                    )
+                    force_end_loop = True
+                    break
+
+                # Enforce hard budget for web tool calls.
+                if self.web_tool_call_hard_limit > 0 and self._is_budgeted_web_tool(
+                    tool_name
+                ):
+                    if web_tool_calls >= self.web_tool_call_hard_limit:
+                        self.task_log.log_step(
+                            "warning",
+                            f"{sub_agent_name} | Web Tool Budget Reached",
+                            (
+                                f"Reached web tool hard limit "
+                                f"({self.web_tool_call_hard_limit}), moving to final summary."
+                            ),
+                        )
+                        force_end_loop = True
+                        break
+                    web_tool_calls += 1
 
                 self.task_log.log_step(
                     "info",
@@ -603,7 +794,6 @@ class Orchestrator:
                     ):
                         if consecutive_rollbacks < self.MAX_CONSECUTIVE_ROLLBACKS - 1:
                             message_history.pop()
-                            turn_count -= 1
                             consecutive_rollbacks += 1
                             should_rollback_turn = True
                             self.task_log.log_step(
@@ -670,6 +860,8 @@ class Orchestrator:
 
             if should_rollback_turn:
                 continue
+            if force_end_loop:
+                break
 
             # Reset consecutive rollbacks on successful execution
             if consecutive_rollbacks > 0:
@@ -848,12 +1040,20 @@ class Orchestrator:
                 "Main Agent | Tool Definitions",
                 "Warning: No tool definitions found. LLM cannot use any tools.",
             )
+        tool_index = self._build_tool_index(tool_definitions)
+        tool_to_server_index = self._build_tool_to_server_index(tool_index)
 
         # Generate system prompt
+        main_agent_extra_instruction = self.cfg.agent.main_agent.get(
+            "system_prompt_skill", ""
+        )
         system_prompt = self.llm_client.generate_agent_system_prompt(
             date=date.today(),
             mcp_servers=tool_definitions,
-        ) + generate_agent_specific_system_prompt(agent_type="main")
+        ) + generate_agent_specific_system_prompt(
+            agent_type="main",
+            extra_instruction=main_agent_extra_instruction,
+        )
         system_prompt = system_prompt.strip()
 
         # Main loop configuration
@@ -862,11 +1062,35 @@ class Orchestrator:
         total_attempts = 0
         max_attempts = max_turns + EXTRA_ATTEMPTS_BUFFER
         consecutive_rollbacks = 0
+        web_tool_calls = 0
+        task_timeout_seconds = float(
+            self.cfg.benchmark.execution.get("task_timeout_seconds", 0)
+        )
+        final_summary_reserve_seconds = float(
+            self.cfg.benchmark.execution.get("final_summary_reserve_seconds", 90)
+        )
+        main_loop_deadline = None
+        if task_timeout_seconds > 0:
+            loop_budget = max(
+                1.0, task_timeout_seconds - max(0.0, final_summary_reserve_seconds)
+            )
+            main_loop_deadline = time.time() + loop_budget
 
         self.current_agent_id = await self.stream.start_agent("main")
         await self.stream.start_llm("main")
 
         while turn_count < max_turns and total_attempts < max_attempts:
+            if main_loop_deadline is not None and time.time() >= main_loop_deadline:
+                self.task_log.log_step(
+                    "warning",
+                    "Main Agent | Time Budget Reached",
+                    (
+                        "Main loop reached time budget; stopping tool-use loop and "
+                        "moving to final summary."
+                    ),
+                )
+                break
+
             turn_count += 1
             total_attempts += 1
 
@@ -923,11 +1147,10 @@ class Orchestrator:
                     )
                     break
             else:
-                turn_count -= 1
                 self.task_log.log_step(
                     "warning",
                     f"Main Agent | Turn: {turn_count} | LLM Call",
-                    "No valid response from LLM, retrying",
+                    "No valid response from LLM, retrying with turn budget consumed",
                 )
                 await asyncio.sleep(5)
                 continue
@@ -969,6 +1192,7 @@ class Orchestrator:
             tool_calls_data = []
             all_tool_results_content_with_id = []
             should_rollback_turn = False
+            force_end_loop = False
             main_agent_last_call_tokens = self.llm_client.last_call_tokens
 
             for call in tool_calls:
@@ -977,10 +1201,72 @@ class Orchestrator:
                 arguments = call["arguments"]
                 call_id = call["id"]
 
+                repaired_server_name, repaired_tool_name, repair_reason = (
+                    self._repair_tool_call_routing(
+                        server_name=server_name,
+                        tool_name=tool_name,
+                        tool_index=tool_index,
+                        tool_to_server_index=tool_to_server_index,
+                    )
+                )
+                if repair_reason:
+                    self.task_log.log_step(
+                        "info",
+                        f"Main Agent | Turn: {turn_count} | Tool Routing Repaired",
+                        (
+                            f"Auto-repaired routing ({repair_reason}): "
+                            f"{server_name}/{tool_name} -> {repaired_server_name}/{repaired_tool_name}"
+                        ),
+                    )
+                    server_name = repaired_server_name
+                    tool_name = repaired_tool_name
+
                 # Fix common parameter name mistakes
                 arguments = self.tool_executor.fix_tool_call_arguments(
                     tool_name, arguments
                 )
+
+                # Validate server/tool routing before execution.
+                is_valid, validation_error = self._validate_tool_call(
+                    server_name, tool_name, tool_index
+                )
+                if not is_valid:
+                    if consecutive_rollbacks < self.MAX_CONSECUTIVE_ROLLBACKS - 1:
+                        if message_history and message_history[-1]["role"] == "assistant":
+                            message_history.pop()
+                        consecutive_rollbacks += 1
+                        should_rollback_turn = True
+                        self.task_log.log_step(
+                            "warning",
+                            f"Main Agent | Turn: {turn_count} | Rollback",
+                            f"Invalid tool routing: {validation_error}. "
+                            f"Consecutive rollbacks: {consecutive_rollbacks}/{self.MAX_CONSECUTIVE_ROLLBACKS}",
+                        )
+                        break
+                    self.task_log.log_step(
+                        "warning",
+                        "Main Agent | End After Max Rollbacks",
+                        f"Ending loop after repeated invalid tool routing: {validation_error}",
+                    )
+                    force_end_loop = True
+                    break
+
+                # Enforce hard budget for web tool calls.
+                if self.web_tool_call_hard_limit > 0 and self._is_budgeted_web_tool(
+                    tool_name
+                ):
+                    if web_tool_calls >= self.web_tool_call_hard_limit:
+                        self.task_log.log_step(
+                            "warning",
+                            "Main Agent | Web Tool Budget Reached",
+                            (
+                                f"Reached web tool hard limit "
+                                f"({self.web_tool_call_hard_limit}), moving to final summary."
+                            ),
+                        )
+                        force_end_loop = True
+                        break
+                    web_tool_calls += 1
 
                 call_start_time = time.time()
                 try:
@@ -1096,7 +1382,6 @@ class Orchestrator:
                                 < self.MAX_CONSECUTIVE_ROLLBACKS - 1
                             ):
                                 message_history.pop()
-                                turn_count -= 1
                                 consecutive_rollbacks += 1
                                 should_rollback_turn = True
                                 self.task_log.log_step(
@@ -1162,6 +1447,8 @@ class Orchestrator:
 
             if should_rollback_turn:
                 continue
+            if force_end_loop:
+                break
 
             # Reset consecutive rollbacks on successful execution
             if consecutive_rollbacks > 0:

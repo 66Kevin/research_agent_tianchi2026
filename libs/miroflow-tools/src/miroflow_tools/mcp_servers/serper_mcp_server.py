@@ -67,10 +67,9 @@ def google_search(
     autocorrect: bool | None = None,
 ):
     """
-    Tool to perform web searches via Serper API and retrieve rich results.
+    Tool to perform web searches and retrieve rich results.
 
-    It is able to retrieve organic search results, people also ask,
-    related searches, and knowledge graph.
+    Uses Serper API for web search.
 
     Args:
         q: Search query string
@@ -86,23 +85,23 @@ def google_search(
     Returns:
         Dictionary containing search results and metadata.
     """
-    # Check for API key
-    if not SERPER_API_KEY:
-        return json.dumps(
-            {
-                "success": False,
-                "error": "SERPER_API_KEY environment variable not set",
-                "results": [],
-            },
-            ensure_ascii=False,
-        )
-
     # Validate required parameter
     if not q or not q.strip():
         return json.dumps(
             {
                 "success": False,
                 "error": "Search query 'q' is required and cannot be empty",
+                "results": [],
+            },
+            ensure_ascii=False,
+        )
+
+    # Check provider credentials
+    if not SERPER_API_KEY:
+        return json.dumps(
+            {
+                "success": False,
+                "error": "SERPER_API_KEY is not set; google_search tool is unavailable",
                 "results": [],
             },
             ensure_ascii=False,
