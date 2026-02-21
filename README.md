@@ -32,6 +32,7 @@
 | 3 | qwen3-max     | google-search               | 0.3535 | -           |         |
 | 4 | qwen3-max     | google-search (search-only) | 0.5051 | search-only tool policy (blacklist sogou_search); MCP tool-call parsing hardening (`_normalize_mcp_name` + malformed `<use_mcp_tool>` fallback); qwen `enable_thinking` + reasoning log | local run, 97/100 completed (last 3 manually stopped) |
 | 5 | qwen3.5-plus  | google-search (Serper only) | 0.5152 | stage-1 efficiency prompt skill; tool routing auto-repair; web tool hard-limit; data-inspection rollback/minimal-context retry; timeout/final-summary reserve | full run, 100/100 completed |
+| 6 | qwen3.5-plus  | google-search, jina scrape  | 0.5758 | enhance jina scrape usage by prompts | full run, 100/100 completed |
 
 Log Path：
 1. logs/gaia-validation/deepseek_deepseek-chat_mirothinker_v1.5_keep5_max200/run_20260206_110146
@@ -39,6 +40,7 @@ Log Path：
 3. logs/tianchi-validation/qwen_qwen3-max_mirothinker_v1.5_keep5_max200_tianchi
 4. apps/miroflow-agent/logs/tianchi-validation/qwen_qwen3-max_mirothinker_v1.5_search_only_keep5_max200/fg_full_probe_20260216_154936
 5. logs/tianchi-validation/qwen_qwen3.5-plus_mirothinker_v1.5_keep5_max200/v5_serper_newkey_full_20260219_082009
+6. logs/tianchi-validation/qwen_qwen3.5-plus_mirothinker_v1.5_keep5_max200_tianchi/run_20260220_104009_score0.57
 
 Run Note:
 - local run completed 97 tasks before manual stop
