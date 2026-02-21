@@ -470,7 +470,16 @@ class OpenAIClient(BaseClient):
                         "LLM | Data Inspection Failed",
                         f"Persistent data inspection failure after {attempt + 1} attempts: {str(e)}",
                     )
-                    raise e
+                    blocked_reason = (
+                        "Provider blocked request due to data inspection policy: "
+                        f"{str(e)}"
+                    )
+                    self.task_log.log_step(
+                        "error",
+                        "LLM | Policy Blocked",
+                        blocked_reason,
+                    )
+                    raise PolicyBlockedError(blocked_reason) from e
 
                 if "Error code: 400" in str(e) and "longer than the model" in str(e):
                     self.task_log.log_step(

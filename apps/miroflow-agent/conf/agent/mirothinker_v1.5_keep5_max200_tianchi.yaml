@@ -8,21 +8,32 @@ defaults:
 main_agent:
   tools:
     - search_and_scrape_webpage
+    - jina_scrape_llm_summary
   tool_blacklist:
     - [ "search_and_scrape_webpage", "sogou_search" ]
     - [ "tool-python", "download_file_from_sandbox_to_local" ]
   max_turns: 200  # Maximum number of turns for main agent execution
-  web_tool_call_hard_limit: 10
+  web_tool_call_hard_limit: 50
   system_prompt_skill: |
     Tianchi stage-1 web QA efficiency skill:
     - Before any tool call, extract the expected answer type, language, and exact output format from the question.
     - Use targeted queries, not broad paraphrases. Each new query must introduce new constraints (entity, year, location, source, or relation).
-    - Default search budget is <= 6 calls. Hard limit is 10 calls. If the budget is nearly exhausted, stop searching and return the best-supported candidate.
+    - Strict behavior rules for web QA:
+      - After each `search_and_scrape_webpage/google_search` call, evaluate whether snippets are sufficient to support the final answer.
+      - Never answer complex questions from snippets alone. Complex questions include multi-hop reasoning, code-level details, precise numeric evidence, timeline reconstruction, or source-grounded claims.
+      - If snippet evidence is incomplete, ambiguous, or lacks concrete support, you must select 1 to 3 most relevant URLs from search results and call `jina_scrape_llm_summary/scrape_and_extract_info` for deep reading before finalizing.
+      - For each scrape call, set `info_to_extract` as a precise sub-question (entity + time + relation), not a broad summary request.
+      - Prefer authoritative or primary sources first. If first scrape fails or is weak, try another candidate URL.
+      - Do not produce the final answer until at least one high-confidence URL has been deeply read when the task requires page-level evidence.
+    - Tool policy:
+      - Use `search_and_scrape_webpage/google_search` to discover candidate URLs only.
+      - Use `jina_scrape_llm_summary/scrape_and_extract_info` to read webpage/PDF content and extract answer-critical facts.
+    - If search budget is nearly exhausted, stop searching and return the best-supported answer.
     - Treat near-duplicate query rewrites as mistakes and avoid repeated semantic searches.
     - Stop early when evidence is sufficient:
       - one authoritative source that directly states the answer; or
       - two independent sources that agree with no contradiction.
-    - Prefer official or primary sources when available, and focus only on facts needed for the final short answer.
+    - Focus only on facts needed for the final short answer.
 
 sub_agents:
 

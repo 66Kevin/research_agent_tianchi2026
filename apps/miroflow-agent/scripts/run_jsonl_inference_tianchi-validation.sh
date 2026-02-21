@@ -18,7 +18,9 @@ MAX_CONTEXT_LENGTH=${MAX_CONTEXT_LENGTH:-262144}
 MAX_CONCURRENT=${MAX_CONCURRENT:-10}
 PASS_AT_K=${PASS_AT_K:-1}
 TEMPERATURE=${TEMPERATURE:-1.0}
-RESUME=${RESUME:-"true"}
+# Default to creating a new run directory each execution.
+# Set RESUME=true explicitly if you want to continue from the latest run directory.
+RESUME=${RESUME:-"false"}
 BACKFILL_FROM_TASK_LOGS=${BACKFILL_FROM_TASK_LOGS:-"true"}
 
 BENCHMARK_NAME="tianchi-validation"
