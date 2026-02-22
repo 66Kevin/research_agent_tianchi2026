@@ -33,6 +33,7 @@
 | 4 | qwen3-max     | google-search (search-only) | 0.5051 | search-only tool policy (blacklist sogou_search); MCP tool-call parsing hardening (`_normalize_mcp_name` + malformed `<use_mcp_tool>` fallback); qwen `enable_thinking` + reasoning log | local run, 97/100 completed (last 3 manually stopped) |
 | 5 | qwen3.5-plus  | google-search (Serper only) | 0.5152 | stage-1 efficiency prompt skill; tool routing auto-repair; web tool hard-limit; data-inspection rollback/minimal-context retry; timeout/final-summary reserve | full run, 100/100 completed |
 | 6 | qwen3.5-plus  | google-search, jina scrape  | 0.5758 | enhance jina scrape usage by prompts | full run, 100/100 completed |
+| 7 | qwen3.5-plus  | serper + jina reader        | 0.4600 | time-limit aware execution (`timeout=600`), Serper retrieval + Jina detail enrichment integrated in Co-Sight framework | full run with parallel=20; Serper/Jina both invoked successfully |
 
 Log Path：
 1. logs/gaia-validation/deepseek_deepseek-chat_mirothinker_v1.5_keep5_max200/run_20260206_110146
@@ -41,7 +42,15 @@ Log Path：
 4. apps/miroflow-agent/logs/tianchi-validation/qwen_qwen3-max_mirothinker_v1.5_search_only_keep5_max200/fg_full_probe_20260216_154936
 5. logs/tianchi-validation/qwen_qwen3.5-plus_mirothinker_v1.5_keep5_max200/v5_serper_newkey_full_20260219_082009
 6. logs/tianchi-validation/qwen_qwen3.5-plus_mirothinker_v1.5_keep5_max200_tianchi/run_20260220_104009_score0.57
+7. /Users/jiatong/Desktop/常用文件/Agent_Competition/tianchi_Co-Sight/logs/tianchi-validation/qwen_qwen3.5-plus_cosight_agentlog_v7_p20_serper_jina_guard_20260222_210948
 
 Run Note:
 - local run completed 97 tasks before manual stop
 - average runtime from task_runtimes.jsonl: 00:17:44
+- latest Co-Sight run records time-limit control + successful Serper/Jina calls, score: 0.46
+
+Known Issues (latest Co-Sight run):
+- Under parallel=20, Serper can occasionally return `429 Too Many Requests` (observed in a small subset of calls).
+- Jina reader has frequent site-level failures (`429/451/timeout`) due upstream anti-crawler/legal restrictions on target pages.
+- A few tasks still hit per-question timeout and rely on fallback answers/empty fallback.
+- External source variability (access policy changes, region blocking, dynamic pages/CAPTCHA) introduces answer instability.
