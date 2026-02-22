@@ -1,0 +1,13 @@
+{
+  "limit": 100,
+  "account": {
+    "name1": {
+      "GOOGLE_API_KEY": "",
+      "SEARCH_ENGINE_ID": ""
+    },
+    "name2": {
+      "GOOGLE_API_KEY": "",
+      "SEARCH_ENGINE_ID": ""
+    }
+  }
+}

@@ -1,0 +1,102 @@
+# Copyright 2025 ZTE Corporation.
+# All Rights Reserved.
+#
+#    Licensed under the Apache License, Version 2.0 (the "License"); you may
+#    not use this file except in compliance with the License. You may obtain
+#    a copy of the License at
+#
+#         http://www.apache.org/licenses/LICENSE-2.0
+#
+#    Unless required by applicable law or agreed to in writing, software
+#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+#    License for the specific language governing permissions and limitations
+#    under the License.
+
+# Copyright 2025 ZTE Corporation.
+# All Rights Reserved.
+#
+#    Licensed under the Apache License, Version 2.0 (the "License"); you may
+#    not use this file except in compliance with the License. You may obtain
+#    a copy of the License at
+#
+#         http://www.apache.org/licenses/LICENSE-2.0
+#
+#    Unless required by applicable law or agreed to in writing, software
+#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+#    License for the specific language governing permissions and limitations
+#    under the License.
+import httpx
+from openai import OpenAI
+
+from app.manus.llm.chat_llm import ChatLLM
+from config.config import *
+
+
+def set_model(model_config: dict[str, Optional[str | int | float]]):
+    http_client_kwargs = {
+        "headers": {
+            'Content-Type': 'application/json',
+            'Authorization': model_config['api_key']
+        },
+        "verify": False,
+        "trust_env": False
+    }
+
+    if model_config['proxy']:
+        http_client_kwargs["proxy"] = model_config['proxy']
+        # http_client_kwargs["proxy"] = None
+
+    openai_llm = OpenAI(
+        base_url=model_config['base_url'],
+        api_key=model_config['api_key'],
+        http_client=httpx.Client(**http_client_kwargs)
+    )
+
+    chat_llm_kwargs = {
+        "model": model_config['model'],
+        "base_url": model_config['base_url'],
+        "api_key": model_config['api_key'],
+        "client": openai_llm
+    }
+
+    if model_config.get('max_tokens') is not None:
+        chat_llm_kwargs['max_tokens'] = model_config['max_tokens']
+    if model_config.get('temperature') is not None:
+        chat_llm_kwargs['temperature'] = model_config['temperature']
+
+    return ChatLLM(**chat_llm_kwargs)
+
+# first route
+plan_model_config = get_plan_model_config()
+llm_for_plan = set_model(plan_model_config)
+
+act_model_config = get_act_model_config()
+llm_for_act = set_model(act_model_config)
+
+tool_model_config = get_tool_model_config()
+llm_for_tool = set_model(tool_model_config)
+
+vision_model_config = get_vision_model_config()
+llm_for_vision = set_model(vision_model_config)
+
+
+# second route
+plan_model_config_route2 = get_second_route_model_config()
+llm_for_plan_route2 = set_model(plan_model_config_route2)
+
+act_model_config_route2 = get_second_route_model_config()
+llm_for_act_route2 = set_model(act_model_config_route2)
+
+tool_model_config_route2 = get_second_route_model_config()
+llm_for_tool_route2 = set_model(tool_model_config_route2)
+
+vision_model_config_route2 = get_second_route_model_config()
+llm_for_vision_route2 = set_model(vision_model_config_route2)
+
+# # judge model
+# judge_model_config = get_judge_model_config()
+# llm_for_judge = set_model(judge_model_config)
+
+
