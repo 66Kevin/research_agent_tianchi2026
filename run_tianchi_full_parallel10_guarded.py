@@ -105,6 +105,7 @@ def main() -> None:
     parser.add_argument("--jina-enrich-max-chars", type=int, default=1200, help="Max chars retained from each Jina reader response.")
     parser.add_argument("--poll-seconds", type=int, default=3, help="Failure scan interval.")
     parser.add_argument("--report-seconds", type=int, default=20, help="Progress print interval.")
+    parser.add_argument("--full-log", action="store_true", help="Disable truncation in task JSON logs.")
     args = parser.parse_args()
 
     cwd = Path(__file__).resolve().parent
@@ -145,6 +146,8 @@ def main() -> None:
         "--timeout",
         str(args.timeout),
     ]
+    if args.full_log:
+        cmd.append("--full-log")
 
     print(f"TASK_LOG_DIR={task_log_dir}")
     print(f"ANS_FILE={answers_file}")
@@ -155,6 +158,7 @@ def main() -> None:
     print(f"JINA_ENRICH_TOP_K={env['JINA_ENRICH_TOP_K']}")
     print(f"JINA_ENRICH_TIMEOUT={env['JINA_ENRICH_TIMEOUT']}")
     print(f"JINA_ENRICH_MAX_CHARS={env['JINA_ENRICH_MAX_CHARS']}")
+    print(f"FULL_LOG={args.full_log}")
     sys.stdout.flush()
 
     task_log_dir.mkdir(parents=True, exist_ok=True)

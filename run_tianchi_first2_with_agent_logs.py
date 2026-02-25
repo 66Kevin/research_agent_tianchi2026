@@ -20,6 +20,17 @@ MAX_SUB_SESSIONS = 8
 MAX_TEXT_LEN = 2000
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _full_log_enabled() -> bool:
+    return _env_flag("FULL_LOG", False)
+
+
 def load_questions(question_file: Path, count: int | None) -> list[dict[str, Any]]:
     questions: list[dict[str, Any]] = []
     with question_file.open("r", encoding="utf-8") as f:
@@ -142,6 +153,8 @@ def _pack_message_history(messages: list[dict[str, Any]]) -> dict[str, Any]:
 
 def _truncate_text(value: Any, limit: int = MAX_TEXT_LEN) -> str:
     text = str(value)
+    if _full_log_enabled() or limit <= 0:
+        return text
     if len(text) <= limit:
         return text
     return text[:limit] + " ...<truncated>"
@@ -150,7 +163,11 @@ def _truncate_text(value: Any, limit: int = MAX_TEXT_LEN) -> str:
 def _trim_history_payload(history: dict[str, Any], max_messages: int = MAX_MESSAGE_HISTORY) -> dict[str, Any]:
     messages = history.get("message_history", [])
     trimmed: list[dict[str, Any]] = []
-    for m in messages[:max_messages]:
+    if _full_log_enabled() or max_messages <= 0:
+        source_messages = messages
+    else:
+        source_messages = messages[:max_messages]
+    for m in source_messages:
         msg = _message_to_dict(m)
         trimmed.append(msg)
     return {"system_prompt": _truncate_text(history.get("system_prompt", "")), "message_history": trimmed}
@@ -220,7 +237,7 @@ def _build_step_logs(
         step_logs.append(
             {
                 "step_name": step_name,
-                "message": message[:3000],
+                "message": _truncate_text(message, 3000),
                 "timestamp": _now_human(),
                 "info_level": info_level,
                 "metadata": metadata or {},
@@ -230,34 +247,46 @@ def _build_step_logs(
     add_event("Main | Task Start", "Task execution started", metadata={"source_agent": "main_agent"})
 
     current_agent = "main_agent"
-    for line in runtime_lines[:1500]:
+    if _full_log_enabled():
+        runtime_source = runtime_lines
+    else:
+        runtime_source = runtime_lines[:1500]
+    for line in runtime_source:
         text = line.strip()
         if not text:
             continue
         step_name, message, metadata, current_agent = _runtime_line_to_step_event(text, current_agent)
         add_event(step_name, message, metadata=metadata)
 
-    for i, msg in enumerate(main_history.get("message_history", [])[:200]):
+    main_messages = main_history.get("message_history", [])
+    if not _full_log_enabled():
+        main_messages = main_messages[:200]
+    for i, msg in enumerate(main_messages):
         role = msg.get("role", "unknown")
         content = msg.get("content", "")
         if isinstance(content, list):
             content = json.dumps(content, ensure_ascii=False)
         add_event(
             "👑 Main Agent | Speech",
-            f"[{role}] {str(content)[:1200]}",
+            f"[{role}] {_truncate_text(content, 1200)}",
             metadata={"source_agent": "main_agent", "role": role, "message_index": i},
         )
 
-    for session_id, session in list(sub_histories.items())[:20]:
+    sub_items = list(sub_histories.items())
+    if not _full_log_enabled():
+        sub_items = sub_items[:20]
+    for session_id, session in sub_items:
         msgs = session.get("message_history", [])
-        for i, msg in enumerate(msgs[:120]):
+        if not _full_log_enabled():
+            msgs = msgs[:120]
+        for i, msg in enumerate(msgs):
             role = msg.get("role", "unknown")
             content = msg.get("content", "")
             if isinstance(content, list):
                 content = json.dumps(content, ensure_ascii=False)
             add_event(
                 "🤖 Sub Agent | Speech",
-                f"[{role}] {str(content)[:1200]}",
+                f"[{role}] {_truncate_text(content, 1200)}",
                 metadata={
                     "source_agent": "sub_agent",
                     "role": role,
@@ -294,7 +323,10 @@ def _read_runtime_lines(runtime_log_path: Path) -> list[str]:
         text = runtime_log_path.read_text(encoding="utf-8", errors="ignore")
     except Exception:
         return []
-    return [_truncate_text(line) for line in text.splitlines()[:MAX_RUNTIME_LINES]]
+    lines = text.splitlines()
+    if not _full_log_enabled() and MAX_RUNTIME_LINES > 0:
+        lines = lines[:MAX_RUNTIME_LINES]
+    return [_truncate_text(line) for line in lines]
 
 
 def _run_single_question_worker(question: str, runtime_log_path_str: str, result_file_path_str: str) -> None:
@@ -337,7 +369,7 @@ def _run_single_question_worker(question: str, runtime_log_path_str: str, result
         sub_histories_raw = manus.actor_message_history_sessions if isinstance(manus.actor_message_history_sessions, dict) else {}
         sub_histories: dict[str, dict[str, Any]] = {}
         for idx, (session_id, messages) in enumerate(sub_histories_raw.items()):
-            if idx >= MAX_SUB_SESSIONS:
+            if not _full_log_enabled() and idx >= MAX_SUB_SESSIONS:
                 break
             if isinstance(messages, list):
                 sub_histories[str(session_id)] = _trim_history_payload(_pack_message_history(messages))
@@ -513,8 +545,8 @@ def _run_one_question(
     task_log_dir: Path,
     disable_fallback: bool,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    question_id = row["id"]
-    question_text = row["question"]
+    question_id = row["task_id"]
+    question_text = row["task_question"]
 
     runtime_log_path = task_log_dir / f"task_{question_id}_runtime_{_now_file_suffix()}.log"
     result = run_with_timeout(question_text, timeout_seconds, runtime_log_path)
@@ -568,7 +600,11 @@ def main() -> None:
     parser.add_argument("--parallel", type=int, default=1, help="How many questions to run concurrently")
     parser.add_argument("--timeout", type=int, default=600, help="Per-question timeout in seconds")
     parser.add_argument("--disable-fallback", action="store_true", help="Disable direct-answer fallback when framework answer is empty")
+    parser.add_argument("--full-log", action="store_true", help="Disable log truncation and per-section cap limits")
     args = parser.parse_args()
+
+    if args.full_log:
+        os.environ["FULL_LOG"] = "1"
 
     requested_count = None if args.count <= 0 else args.count
     questions = load_questions(args.question_file, requested_count)
@@ -577,7 +613,7 @@ def main() -> None:
 
     parallel = max(1, int(args.parallel))
     total = len(questions)
-    print(f"loaded questions: {total}, parallel={parallel}, timeout={args.timeout}s")
+    print(f"loaded questions: {total}, parallel={parallel}, timeout={args.timeout}s, full_log={_full_log_enabled()}")
 
     output_rows: list[dict[str, Any]] = []
     run_logs: list[dict[str, Any]] = []
