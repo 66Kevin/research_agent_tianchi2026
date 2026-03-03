@@ -1,0 +1,23 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+
+# Environment files
+.env
+retrac/.env
+
+# IDE files
+.vscode/
+
+# Runtime logs and outputs
+retrac/logs/
+
+scripts/
+
+logs/
+
+assets/
