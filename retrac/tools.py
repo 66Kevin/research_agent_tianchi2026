@@ -33,6 +33,7 @@ VISIT_SUMMARIZE_TIMEOUT_S = 45
 TOOL_HTTP_RETRY_ATTEMPTS = int(os.getenv("TOOL_HTTP_RETRY_ATTEMPTS", "2"))
 TOOL_HTTP_RETRY_STATUSES = {429, 500, 502, 503, 504}
 TOOL_RETRY_BACKOFF_S = 0.6
+MAX_SEARCH_QUERIES_PER_CALL = 5
 
 print("=" * 100)
 print(f"SERPER_API_KEY: {SERPER_API_KEY}")
@@ -60,7 +61,7 @@ fields**
 """
 
 class SearchInput(BaseModel):
-    query: list[str] = Field(description="The list of search query strings")
+    query: list[str] = Field(description="The list of search query strings (max 5 will be executed)")
 
 class VisitInput(BaseModel):
     url: list[str] = Field(description="List of URLs to visit")
@@ -589,13 +590,16 @@ async def _visit(urls: list[str], goal: str) -> Dict[str, Any]:
 async def search(query: list[str]) -> str:
     """Search the web for information about a query using google search."""
 
+    requested_query_count = len(query)
+    bounded_query = query[:MAX_SEARCH_QUERIES_PER_CALL]
+
     search_func = _search if TOOL_SERVER_URL else serper_search
-    batch_results = await asyncio.gather(*[search_func(q) for q in query], return_exceptions=True)
+    batch_results = await asyncio.gather(*[search_func(q) for q in bounded_query], return_exceptions=True)
 
     calls: list[Dict[str, Any]] = []
     data: list[Dict[str, Any]] = []
     for idx, result in enumerate(batch_results):
-        query_text = query[idx] if idx < len(query) else ""
+        query_text = bounded_query[idx] if idx < len(bounded_query) else ""
         if isinstance(result, BaseException):
             calls.append(
                 _status(
@@ -624,9 +628,10 @@ async def search(query: list[str]) -> str:
         "tool": "search",
         "ok": success_queries > 0,
         "summary": {
-            "total_queries": len(query),
+            "requested_queries": requested_query_count,
+            "total_queries": len(bounded_query),
             "success_queries": success_queries,
-            "failed_queries": len(query) - success_queries,
+            "failed_queries": len(bounded_query) - success_queries,
         },
         "calls": calls,
         "data": data,

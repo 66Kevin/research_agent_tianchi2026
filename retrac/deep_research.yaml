@@ -1,8 +1,11 @@
-max_turns: 1000
+max_turns: 100
 max_steps: 10000
 max_cycles: 5
+max_tool_turns_in_context: 3
 system_prompt: |
   You are a helpful assistant that can use the **search** tool to search the internet and the **visit** tool to visit the web pages. You will be given an question and you need to answer it.
+  For each **search** tool call, you must provide at most 5 queries.
+  Prefer high-information-gain queries: prioritize disambiguation (entity/time/location), authoritative sources, and broad evidence coverage; avoid near-duplicate query variants.
 continue_prompt: |
   Below is the summary from the previous attempt:
   {last_summary}
@@ -14,6 +17,7 @@ continue_prompt: |
     If the task remains unsolved, it means the current search space is insufficient. Do not get trapped in the "logic loop" of the summary. Use the [Uncertainties, Limitations, Gaps] section as a springboard to:
     - Pivot to entirely different keyword clusters or tool-call strategies.
     - Cross-verify "Facts" that were marked as "unverified" or "partial" in the summary.
+    - For each search tool call, use at most 5 high-information-gain queries and avoid near-duplicate wording.
   3. Autonomous re-planning:
     The summary provides the *memory*, but you provide the *reasoning*. Based on the existing facts and your own judgment of the current situation, determine your own next steps.
   Now continue your deep search task. You have full permission to be skeptical of the past and bold in your current exploration.
@@ -56,9 +60,10 @@ final_summary_prompt: |
   Do NOT output placeholders like “see above”.
   Do NOT output None/Unknown/N/A/empty answer.
   You should follow the output format instruction in the request strictly and wrap the final answer in \\boxed{{}}.
+  **ONLY output the final answer without any explanation.**
 
   OUTPUT FORMAT (EXACT)
-  0) Final Answer (MANDATORY)
+  Final Answer (MANDATORY)
     - Provide exactly one concrete answer wrapped in \\boxed{{}}.
     - If evidence is conclusive, output the conclusive answer.
     - If evidence is inconclusive, you MUST output the single most plausible candidate as a Best-Effort Guess (still wrapped in \\boxed{{}}).
@@ -70,17 +75,6 @@ final_summary_prompt: |
     - If the original question explicitly requires a specific naming form or language (e.g., original name, full English name, Chinese abbreviation), follow that explicit requirement.
     - Do NOT include any punctuation such as '.', '!', or '?' at the end of the answer.
     - Do NOT include any invisible or non-printable characters in the answer output.
-  1) Facts & Evidence Collected
-    - List key facts with source annotation:
-      [Source: <tool/doc> | <URL/id> | Verified: yes/no/partial].
-  2) Analysis & Final Decision
-    - Explain why the boxed answer is selected.
-    - If guessing, explicitly mark: "Decision Type: Best-Effort Guess".
-    - Include confidence: High / Medium / Low.
-  3) Candidate Ranking (Top 3 max)
-    - Rank up to 3 candidates from available evidence with short justification.
-  4) Remaining Uncertainties
-    - List unresolved conflicts or gaps.
 
   QUALITY RULES
   - Prefer evidence-grounded answers over speculation.
@@ -88,11 +82,16 @@ final_summary_prompt: |
   - Never leave the boxed answer empty.
 model:
   model_name: qwen3.5-plus
-  timeout_s: 180
+  temperature: 0.2
+  top_p: 0.95
+  timeout_s: 120
   extra_body:
-    enable_thinking: false
+    enable_thinking: False
   max_context_length: 122880 # 128K - 8K
   enable_qps_limit: false
   tools:
     - search
     - visit
+fallback_model:
+  # Used when timeout-triggered fallback is activated.
+  model_name: qwen3.5-flash

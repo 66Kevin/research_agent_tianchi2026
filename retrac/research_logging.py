@@ -148,6 +148,41 @@ def _extract_boxed_answer(text: str | None) -> str:
     return match.group(1).strip() if match else ""
 
 
+def _is_ai_like_message(message: Any) -> bool:
+    if isinstance(message, AIMessage):
+        return True
+    if isinstance(message, BaseMessage):
+        return type(message).__name__.startswith("AIMessage")
+    if isinstance(message, dict):
+        msg_type = str(message.get("type", "") or "")
+        role = str(message.get("role", "") or "")
+        return msg_type.startswith("AIMessage") or role.lower() == "ai" or role.startswith("AIMessage")
+    return False
+
+
+def _extract_latest_boxed_from_cycle_histories(final_state: Dict[str, Any]) -> str:
+    cycle_histories = final_state.get("cycle_histories")
+    if not isinstance(cycle_histories, list):
+        return ""
+    for cycle_history in reversed(cycle_histories):
+        if not isinstance(cycle_history, list):
+            continue
+        for message in reversed(cycle_history):
+            if not _is_ai_like_message(message):
+                continue
+            if isinstance(message, BaseMessage):
+                text = _message_text(message)
+            elif isinstance(message, dict):
+                content = message.get("content", "")
+                text = content if isinstance(content, str) else str(content)
+            else:
+                text = str(getattr(message, "content", message))
+            boxed = _extract_boxed_answer(text)
+            if boxed:
+                return boxed
+    return ""
+
+
 def _parse_structured_tool_payload(content_text: str) -> Dict[str, Any] | None:
     try:
         payload = json.loads(content_text)
@@ -163,6 +198,44 @@ def _parse_structured_tool_payload(content_text: str) -> Dict[str, Any] | None:
     return payload
 
 
+def _build_llm_content_preview(message: BaseMessage) -> str:
+    text = _message_text(message).strip()
+    if text:
+        return _truncate_text(_sanitize(text), 300)
+
+    tool_calls = getattr(message, "tool_calls", None) or []
+    if isinstance(tool_calls, list) and tool_calls:
+        compact_calls = []
+        for tool_call in tool_calls:
+            if not isinstance(tool_call, dict):
+                compact_calls.append(str(tool_call))
+                continue
+            compact_calls.append(
+                {
+                    "name": tool_call.get("name"),
+                    "id": tool_call.get("id"),
+                    "args": tool_call.get("args"),
+                }
+            )
+        return _truncate_text(
+            _sanitize(f"tool_calls={json.dumps(compact_calls, ensure_ascii=False)}"),
+            300,
+        )
+
+    invalid_tool_calls = getattr(message, "invalid_tool_calls", None) or []
+    if isinstance(invalid_tool_calls, list) and invalid_tool_calls:
+        return _truncate_text(_sanitize(f"invalid_tool_calls={invalid_tool_calls}"), 300)
+
+    response_metadata = getattr(message, "response_metadata", None) or {}
+    finish_reason = ""
+    if isinstance(response_metadata, dict):
+        finish_reason = str(response_metadata.get("finish_reason", "") or "")
+    if finish_reason:
+        return _truncate_text(_sanitize(f"finish_reason={finish_reason}"), 300)
+
+    return "[empty_ai_message]"
+
+
 class ResearchRunLogger:
     def __init__(
         self,
@@ -171,11 +244,13 @@ class ResearchRunLogger:
         question: str,
         cfg: dict,
         task_file_name: str | None = None,
+        console_log: bool = False,
     ) -> None:
         self.run_dir = run_dir
         self.task_id = task_id
         self.cfg = cfg
         self.task_file_name = task_file_name
+        self.console_log = console_log
         self.started_at = datetime.now()
         timestamp = self.started_at.strftime("%Y-%m-%d-%H-%M-%S")
 
@@ -226,13 +301,22 @@ class ResearchRunLogger:
         )
 
     def _build_env_info(self) -> Dict[str, Any]:
-        model_cfg = self.cfg.get("model", {}) if isinstance(self.cfg, dict) else {}
+        model_cfg_raw = self.cfg.get("model", {}) if isinstance(self.cfg, dict) else {}
+        model_cfg = model_cfg_raw if isinstance(model_cfg_raw, dict) else {}
+        fallback_model_cfg_raw = self.cfg.get("fallback_model", {}) if isinstance(self.cfg, dict) else {}
+        fallback_model_cfg = (
+            fallback_model_cfg_raw if isinstance(fallback_model_cfg_raw, dict) else {}
+        )
         return {
             "llm_base_url": _sanitize(model_cfg.get("base_url") or os.getenv("OPENAI_API_BASE")),
             "llm_model_name": _sanitize(model_cfg.get("model_name")),
             "llm_temperature": model_cfg.get("temperature"),
             "llm_top_p": model_cfg.get("top_p"),
             "llm_timeout_s": model_cfg.get("timeout_s"),
+            "fallback_llm_base_url": _sanitize(
+                fallback_model_cfg.get("base_url") or os.getenv("OPENAI_API_BASE")
+            ),
+            "fallback_llm_model_name": _sanitize(fallback_model_cfg.get("model_name")),
             "max_cycles": self.cfg.get("max_cycles"),
             "max_turns": self.cfg.get("max_turns"),
             "has_serper_api_key": bool(os.getenv("SERPER_API_KEY")),
@@ -264,6 +348,16 @@ class ResearchRunLogger:
         }
         self.payload["step_logs"].append(step)
         self._write_event({"event_type": "step", **step})
+        if self.console_log:
+            line = (
+                f"[{step['timestamp']}] "
+                f"[task {self.task_id}] "
+                f"[{str(step['info_level']).upper()}] "
+                f"{step['step_name']} | {step['message']}"
+            )
+            if step["metadata"]:
+                line += f" | metadata={json.dumps(step['metadata'], ensure_ascii=False)}"
+            print(line, flush=True)
 
     def log_graph_event(
         self,
@@ -298,7 +392,7 @@ class ResearchRunLogger:
             return
 
         if node_name == "llm":
-            self._record_llm_event(merged_state)
+            self._record_llm_event(node_output, merged_state)
             return
 
         if node_name == "tools_prep":
@@ -310,7 +404,18 @@ class ResearchRunLogger:
             return
 
         if node_name == "tools_merge":
-            self.log_step("Tools | Merge", "Tool outputs merged into messages.")
+            metadata: Dict[str, Any] = {}
+            if isinstance(node_output, dict):
+                trim_stats = node_output.get("context_trim")
+                if not isinstance(trim_stats, dict):
+                    trim_stats = node_output.get("context_trim_stats")
+                if isinstance(trim_stats, dict):
+                    metadata["context_trim"] = trim_stats
+            self.log_step(
+                "Tools | Merge",
+                "Tool outputs merged into messages.",
+                metadata=metadata,
+            )
             return
 
         if node_name == "end_cycle":
@@ -334,13 +439,48 @@ class ResearchRunLogger:
                 metadata={"output_preview": _truncate_text(_sanitize(output))},
             )
 
-    def _record_llm_event(self, merged_state: Dict[str, Any]) -> None:
-        messages = merged_state.get("messages", [])
-        latest_ai = None
-        for message in reversed(messages):
-            if isinstance(message, AIMessage):
-                latest_ai = message
-                break
+    def _record_llm_event(self, node_output: Any, merged_state: Dict[str, Any]) -> None:
+        def _latest_ai_message(messages: Any) -> BaseMessage | None:
+            if not isinstance(messages, list):
+                return None
+            for message in reversed(messages):
+                if isinstance(message, BaseMessage) and _is_ai_like_message(message):
+                    return message
+            return None
+
+        node_messages = None
+        node_errors = None
+        if isinstance(node_output, dict):
+            node_messages = node_output.get("messages")
+            node_errors = node_output.get("error")
+
+        latest_ai = _latest_ai_message(node_messages)
+        if latest_ai is None and isinstance(node_errors, list) and node_errors:
+            last_error = str(node_errors[-1])
+            self.payload["trace_data"]["llm_calls"].append(
+                {
+                    "timestamp": _now_str(),
+                    "usage_metadata": {},
+                    "tool_call_count": 0,
+                    "content_preview": _truncate_text(_sanitize(last_error), 300),
+                    "status": "error",
+                    "error_count": len(node_errors),
+                    "last_error": _truncate_text(_sanitize(last_error), 300),
+                }
+            )
+            self.log_step(
+                "LLM | Invoke Failed",
+                "LLM node failed without AI response.",
+                "warning",
+                metadata={
+                    "error_count": len(node_errors),
+                    "last_error": _truncate_text(_sanitize(last_error), 300),
+                },
+            )
+            return
+
+        if latest_ai is None:
+            latest_ai = _latest_ai_message(merged_state.get("messages", []))
         if latest_ai is None:
             self.log_step("LLM | Invoke", "LLM node finished without AIMessage.", "warning")
             return
@@ -352,7 +492,8 @@ class ResearchRunLogger:
                 "timestamp": _now_str(),
                 "usage_metadata": usage_metadata,
                 "tool_call_count": len(tool_calls),
-                "content_preview": _truncate_text(_sanitize(_message_text(latest_ai)), 300),
+                "content_preview": _build_llm_content_preview(latest_ai),
+                "status": "success",
             }
         )
         self.log_step(
@@ -545,6 +686,8 @@ class ResearchRunLogger:
         output = final_state.get("output", "")
         output_text = output if isinstance(output, str) else str(output)
         boxed_answer = _extract_boxed_answer(output_text)
+        if not boxed_answer:
+            boxed_answer = _extract_latest_boxed_from_cycle_histories(final_state)
         self.payload["status"] = "success"
         self.payload["error"] = ""
         self.payload["end_time"] = _now_str()

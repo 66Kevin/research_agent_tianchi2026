@@ -121,6 +121,7 @@ API_KEY_FOR_VISIT_SUMMARIZE=YOUR_API_KEY_HERE_FOR_SUMMARIZE_MODEL_IN_VISIT_TOOL
 ```bash
 uv run run.py --config retrac/deep_research.yaml --question 0
 ```
+Single-task mode now uses real-time LLM token streaming output by default.
 
 `--question` now accepts a `task_id` integer and loads the corresponding `task_question` from the default JSONL:
 `/data/dataset2/Workshop/wangyueyi/test/question.jsonl`
@@ -167,7 +168,14 @@ You can modify the config file in `retrac/deep_research.yaml` to change the max 
 ```yaml
 max_cycles: 8 # we default set the max cycles to 8, you may change it to 2 or 4 for faster inference
 xxx_prompt: # you can modify the xxx_prompt to change the system prompt, the continue prompt, the summary prompt, for other tasks.
+fallback_model:
+  model_name: qwen3-max # optional timeout-only fallback model
 ```
+
+Timeout fallback behavior:
+- Only timeout errors trigger model fallback; non-timeout errors keep the original behavior.
+- Normal phase: primary model retries `max_cycles` times on timeout, then fallback model retries `max_cycles` times.
+- Forced final summary phase: on first primary timeout, switch to fallback model immediately; fallback retries `max_cycles` times.
 
 ## Citation
 

@@ -16,8 +16,8 @@ from retrac.graph import build_graph
 from retrac.research_logging import ResearchRunLogger, create_run_directory
 
 DEFAULT_TASK_FILE = "/data/dataset2/Workshop/wangyueyi/test/question.jsonl"
-TASK_FORCE_END_CYCLE_S = 570.0
-TASK_FINAL_FALLBACK_S = 595.0
+TASK_FORCE_END_CYCLE_S = 550.0
+TASK_FINAL_FALLBACK_S = 597.0
 TASK_HARD_TIMEOUT_S = 600.0
 TOOL_NODE_WATCHDOG_S = 75.0
 
@@ -214,7 +214,19 @@ async def run_forced_end_cycle_summary(
         return False, "", normalize_stats
 
     model_cfg = ModelConfig.model_validate(cfg.get("model", {}))
-    llm_node = create_llm_node(model_cfg=model_cfg)
+    fallback_model_cfg = None
+    fallback_model_raw = cfg.get("fallback_model")
+    if isinstance(fallback_model_raw, dict) and fallback_model_raw:
+        fallback_model_cfg = ModelConfig.model_validate(fallback_model_raw)
+    max_cycles = cfg.get("max_cycles")
+    timeout_retry_attempts = max_cycles if isinstance(max_cycles, int) and max_cycles > 0 else None
+    llm_node = create_llm_node(
+        model_cfg=model_cfg,
+        fallback_model_cfg=fallback_model_cfg,
+        timeout_retry_attempts=timeout_retry_attempts,
+        timeout_fallback_mode="immediate_on_primary_timeout",
+        stream_token_output=bool(cfg.get("stream_token_output")),
+    )
 
     summary_input = {
         "messages": list(normalized_messages) + [HumanMessage(content=summary_prompt_tmpl.format(input=question))],
@@ -332,6 +344,7 @@ async def execute_task(
     run_dir: Path,
     task_file_name: str | None = None,
     stream_messages: bool = False,
+    console_log: bool = False,
 ) -> tuple[bool, Dict[str, Any], float]:
     logger = ResearchRunLogger(
         run_dir=run_dir,
@@ -339,6 +352,7 @@ async def execute_task(
         question=question,
         cfg=cfg,
         task_file_name=task_file_name,
+        console_log=console_log,
     )
     merged_state: Dict[str, Any] = {}
     seen_messages: set[int] = set()
@@ -562,6 +576,7 @@ async def run_single_task(
     question: str,
     task_file_name: str | None,
     non_streaming: bool,
+    console_log: bool,
 ) -> int:
     ok, state, runtime_seconds = await execute_task(
         app=app,
@@ -570,13 +585,30 @@ async def run_single_task(
         cfg=cfg,
         run_dir=run_dir,
         task_file_name=task_file_name,
-        stream_messages=not non_streaming,
+        stream_messages=(not non_streaming) and (not bool(cfg.get("stream_token_output"))),
+        console_log=console_log,
     )
-    answer = extract_boxed_answer(state.get("output")) if ok else ""
+    answer = ""
+    if ok:
+        answer = extract_boxed_answer(state.get("output"))
+        if not answer:
+            answer = extract_last_completed_cycle_answer(state)
     record_task_outputs(run_dir=run_dir, task_id=task_id, answer=answer, runtime_seconds=runtime_seconds)
 
     if state.get("output"):
-        print(state["output"])
+        output_text = str(state["output"])
+        output_boxed = extract_boxed_answer(output_text)
+        if output_boxed:
+            if bool(cfg.get("stream_token_output")):
+                print(f"\\boxed{{{output_boxed}}}")
+            else:
+                print(output_text)
+        elif answer:
+            print(f"\\boxed{{{answer}}}")
+        elif not bool(cfg.get("stream_token_output")):
+            print(output_text)
+    elif ok and answer:
+        print(f"\\boxed{{{answer}}}")
     if not ok:
         print("Task failed. Please check the generated log file for details.")
         return 1
@@ -588,6 +620,7 @@ async def run_batch_tasks(
     cfg: dict,
     run_dir: Path,
     task_file: Path,
+    console_log: bool,
 ) -> int:
     success_count = 0
     failed_count = 0
@@ -609,6 +642,7 @@ async def run_batch_tasks(
                     question="",
                     cfg=cfg,
                     task_file_name=task_file.name,
+                    console_log=console_log,
                 )
                 logger.log_step(
                     "Main | Task Validation",
@@ -635,8 +669,13 @@ async def run_batch_tasks(
                 run_dir=run_dir,
                 task_file_name=task_file.name,
                 stream_messages=False,
+                console_log=console_log,
             )
-            answer = extract_boxed_answer(state.get("output")) if ok else ""
+            answer = ""
+            if ok:
+                answer = extract_boxed_answer(state.get("output"))
+                if not answer:
+                    answer = extract_last_completed_cycle_answer(state)
             record_task_outputs(run_dir=run_dir, task_id=task_id, answer=answer, runtime_seconds=runtime_seconds)
             if ok:
                 success_count += 1
@@ -680,11 +719,17 @@ async def main() -> None:
     parser.add_argument(
         "--non-streaming",
         action="store_true",
-        help="Only for --question mode. Disable streaming message output.",
+        help="Only for --question mode. Disable real-time LLM token streaming output.",
+    )
+    parser.add_argument(
+        "--console-log",
+        action="store_true",
+        help="Print step logs to console in real time (works in both single and batch modes).",
     )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+    cfg.setdefault("stream_token_output", bool(args.question is not None and not args.non_streaming))
     graph = build_graph(cfg)
     app = graph.compile()
     run_dir = create_run_directory("retrac/logs")
@@ -696,6 +741,7 @@ async def main() -> None:
             cfg=cfg,
             run_dir=run_dir,
             task_file=Path(args.task_file),
+            console_log=args.console_log,
         )
     else:
         question_source = Path(args.question_source)
@@ -707,6 +753,7 @@ async def main() -> None:
                 question="",
                 cfg=cfg,
                 task_file_name=question_source.name,
+                console_log=args.console_log,
             )
             logger.log_step("Main | Task Lookup", error, info_level="error")
             logger.finalize_error(error, final_state={"messages": [], "output": ""})
@@ -722,6 +769,7 @@ async def main() -> None:
             question=question or "",
             task_file_name=question_source.name,
             non_streaming=args.non_streaming,
+            console_log=args.console_log,
         )
 
     raise SystemExit(exit_code)
