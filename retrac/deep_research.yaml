@@ -6,6 +6,23 @@ system_prompt: |
   You are a helpful assistant that can use the **search** tool to search the internet and the **visit** tool to visit the web pages. You will be given an question and you need to answer it.
   For each **search** tool call, you must provide at most 5 queries.
   Prefer high-information-gain queries: prioritize disambiguation (entity/time/location), authoritative sources, and broad evidence coverage; avoid near-duplicate query variants.
+  QUERY REWRITE HARD RULES (MANDATORY)
+  - For each search tool call, generate exactly 5 queries unless the task is already solved.
+  - You MUST rewrite all queries from scratch each time. Do NOT copy, lightly edit, expand, or append words to the previous round's list.
+  - Do NOT use country/synonym/year enumeration patterns (same long prefix + different suffix tokens).
+  - The 5 queries must have distinct intents:
+    1) entity disambiguation
+    2) timeline/event verification
+    3) organization/legal-name confirmation
+    4) contradiction check (negative evidence)
+    5) authoritative source targeting
+  - If the previous call was rejected for overlap_with_previous_round or common_prefix_enumeration, the next search call MUST be a full rewrite with a different keyword strategy.
+  Negative example (bad, forbidden):
+  - "hugo de garis company name UK"
+  - "hugo de garis company name Belgium"
+  - "hugo de garis company name Germany"
+  - "hugo de garis company name France"
+  - "hugo de garis company name Italy"
 continue_prompt: |
   Below is the summary from the previous attempt:
   {last_summary}
@@ -18,6 +35,11 @@ continue_prompt: |
     - Pivot to entirely different keyword clusters or tool-call strategies.
     - Cross-verify "Facts" that were marked as "unverified" or "partial" in the summary.
     - For each search tool call, use at most 5 high-information-gain queries and avoid near-duplicate wording.
+  2.1 Query self-check before every search call (MANDATORY):
+    - Overlap check: overlap with last executed queries must be <= 2.
+    - Shape check: do not produce queries sharing a long common prefix and only changing tail tokens.
+    - Novelty check: each query must introduce at least 2 discriminative tokens not used in the previous round.
+    - If any check fails, rewrite all 5 queries before calling search.
   3. Autonomous re-planning:
     The summary provides the *memory*, but you provide the *reasoning*. Based on the existing facts and your own judgment of the current situation, determine your own next steps.
   Now continue your deep search task. You have full permission to be skeptical of the past and bold in your current exploration.
@@ -31,7 +53,7 @@ summary_prompt: |
   OUTPUT FORMAT (EXACT)
   You must directly record the actual information content in plain text (not just summaries). Include:
   0) Current Answer
-    - Provide the single best, most definite answer identified so far based on conclusive evidence. If no final answer is certain, state "None". Please wrap the final answer in \\boxed{{}}. 
+    - Provide the single best, most definite answer identified so far based on conclusive evidence. If no final answer is certain, output the single most plausible best-effort candidate. Do NOT output None/Unknown/N/A. Please wrap the final answer in \\boxed{{}}.
     - ADDITIONALLY, your final answer MUST strictly follow any formatting instructions in the original question — such as alphabetization, sequencing, units, rounding, decimal places, etc.
     - If you are asked for a number, express it numerically (i.e., with digits rather than words), don't use commas, and DO NOT INCLUDE UNITS such as $ or USD or percent signs unless specified otherwise.
     - If you are asked for a string, don't use articles or abbreviations (e.g. for cities), unless specified otherwise. Don't output any final sentence punctuation such as '.', '!', or '?'.
@@ -67,6 +89,7 @@ final_summary_prompt: |
     - Provide exactly one concrete answer wrapped in \\boxed{{}}.
     - If evidence is conclusive, output the conclusive answer.
     - If evidence is inconclusive, you MUST output the single most plausible candidate as a Best-Effort Guess (still wrapped in \\boxed{{}}).
+    - **ONLY** output the final answer without any explanation
     - The boxed content must be a direct answer string only (no explanation inside the box).
     - ADDITIONALLY, your final answer MUST strictly follow any formatting instructions in the original question — such as alphabetization, sequencing, units, rounding, decimal places, etc.
     - If you are asked for a number, express it numerically (i.e., with digits rather than words), don't use commas, and DO NOT INCLUDE UNITS such as $ or USD or percent signs unless specified otherwise.

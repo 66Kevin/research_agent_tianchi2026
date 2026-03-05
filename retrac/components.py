@@ -232,6 +232,7 @@ def create_llm_node(
     timeout_retry_attempts: int | None = None,
     timeout_fallback_mode: TimeoutFallbackMode = "after_primary_timeout_retries",
     stream_token_output: bool = False,
+    enable_streaming_invoke: bool = True,
 ) -> Callable[[Dict[str, Any]], Dict[str, Any]]:
 
     tools = model_cfg.tools
@@ -291,7 +292,7 @@ def create_llm_node(
         ) -> Dict[str, Any]:
             timeout_failures = 0
             non_timeout_failures = 0
-            use_stream = True
+            use_stream = bool(enable_streaming_invoke)
 
             while True:
                 attempt_no = len(llm_attempts) + 1

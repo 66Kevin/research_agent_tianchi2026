@@ -94,6 +94,44 @@ def _status(
     }
 
 
+def _build_guard_rejected_payload(
+    *,
+    tool_name: str,
+    query: list[str],
+    reason_code: str,
+    invalid_streak: int = 0,
+    overlap_count: int = 0,
+) -> Dict[str, Any]:
+    target = query[0] if query else ""
+    return {
+        "tool": tool_name,
+        "ok": False,
+        "summary": {
+            "requested_queries": len(query),
+            "total_queries": 0,
+            "success_queries": 0,
+            "failed_queries": 0,
+        },
+        "calls": [
+            {
+                "ok": False,
+                "http_status": None,
+                "status": "REJECTED",
+                "elapsed_ms": 0,
+                "error_type": "query_guard",
+                "error_message": f"Tool call rejected by query guard: {reason_code}",
+                "target": target,
+            }
+        ],
+        "guard": {
+            "reason_code": reason_code,
+            "invalid_streak": invalid_streak,
+            "overlap_count": overlap_count,
+        },
+        "data": [],
+    }
+
+
 def _should_retry(http_status: int | None, status: str) -> bool:
     if status == "TIMEOUT":
         return True
@@ -591,6 +629,14 @@ async def search(query: list[str]) -> str:
     """Search the web for information about a query using google search."""
 
     requested_query_count = len(query)
+    if requested_query_count > MAX_SEARCH_QUERIES_PER_CALL:
+        payload = _build_guard_rejected_payload(
+            tool_name="search",
+            query=query,
+            reason_code="too_many_queries_unfiltered",
+        )
+        return json.dumps(payload, ensure_ascii=False)
+
     bounded_query = query[:MAX_SEARCH_QUERIES_PER_CALL]
 
     search_func = _search if TOOL_SERVER_URL else serper_search

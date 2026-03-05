@@ -20,6 +20,7 @@ TASK_FORCE_END_CYCLE_S = 550.0
 TASK_FINAL_FALLBACK_S = 597.0
 TASK_HARD_TIMEOUT_S = 600.0
 TOOL_NODE_WATCHDOG_S = 75.0
+FORCED_SUMMARY_MODEL_NAME = "qwen3.5-flash"
 
 
 def extract_boxed_answer(text: str | None) -> str:
@@ -213,19 +214,22 @@ async def run_forced_end_cycle_summary(
     if not normalized_messages:
         return False, "", normalize_stats
 
-    model_cfg = ModelConfig.model_validate(cfg.get("model", {}))
-    fallback_model_cfg = None
     fallback_model_raw = cfg.get("fallback_model")
-    if isinstance(fallback_model_raw, dict) and fallback_model_raw:
-        fallback_model_cfg = ModelConfig.model_validate(fallback_model_raw)
+    summary_model_raw = fallback_model_raw if isinstance(fallback_model_raw, dict) and fallback_model_raw else cfg.get("model", {})
+    model_cfg = ModelConfig.model_validate(summary_model_raw)
+    if hasattr(model_cfg, "model_copy"):
+        model_cfg = model_cfg.model_copy(update={"model_name": FORCED_SUMMARY_MODEL_NAME})
+    else:
+        model_cfg = model_cfg.copy(update={"model_name": FORCED_SUMMARY_MODEL_NAME})
     max_cycles = cfg.get("max_cycles")
     timeout_retry_attempts = max_cycles if isinstance(max_cycles, int) and max_cycles > 0 else None
     llm_node = create_llm_node(
         model_cfg=model_cfg,
-        fallback_model_cfg=fallback_model_cfg,
+        fallback_model_cfg=None,
         timeout_retry_attempts=timeout_retry_attempts,
         timeout_fallback_mode="immediate_on_primary_timeout",
-        stream_token_output=bool(cfg.get("stream_token_output")),
+        stream_token_output=False,
+        enable_streaming_invoke=False,
     )
 
     summary_input = {

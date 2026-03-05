@@ -93,6 +93,35 @@ def _sanitize(value: Any, parent_key: str | None = None) -> Any:
     return _truncate_text(_mask_text(str(value)))
 
 
+def _sanitize_no_truncate(value: Any, parent_key: str | None = None) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, (int, float, bool)):
+        return value
+    if isinstance(value, str):
+        text = _mask_text(value)
+        if _should_mask_key(parent_key):
+            text = _mask_value(text)
+        return text
+    if isinstance(value, BaseMessage):
+        # Keep existing serialized schema; avoid re-implementing message serialization.
+        return _serialize_message(value)
+    if isinstance(value, list):
+        return [_sanitize_no_truncate(v, parent_key=parent_key) for v in value]
+    if isinstance(value, tuple):
+        return [_sanitize_no_truncate(v, parent_key=parent_key) for v in value]
+    if isinstance(value, dict):
+        out: Dict[str, Any] = {}
+        for k, v in value.items():
+            key = str(k)
+            if _should_mask_key(key):
+                out[key] = _mask_value(str(v))
+            else:
+                out[key] = _sanitize_no_truncate(v, parent_key=key)
+        return out
+    return _mask_text(str(value))
+
+
 def _message_text(message: BaseMessage) -> str:
     text = getattr(message, "text", None)
     if isinstance(text, str) and text:
@@ -198,10 +227,25 @@ def _parse_structured_tool_payload(content_text: str) -> Dict[str, Any] | None:
     return payload
 
 
-def _build_llm_content_preview(message: BaseMessage) -> str:
+def _build_llm_content_preview(
+    message: BaseMessage,
+    *,
+    truncate: bool = True,
+    max_chars: int = 300,
+) -> str:
+    sanitize_fn = _sanitize if truncate else _sanitize_no_truncate
+
+    def _render(text: str) -> str:
+        sanitized = sanitize_fn(text)
+        if not isinstance(sanitized, str):
+            sanitized = str(sanitized)
+        if truncate:
+            return _truncate_text(sanitized, max_chars)
+        return sanitized
+
     text = _message_text(message).strip()
     if text:
-        return _truncate_text(_sanitize(text), 300)
+        return _render(text)
 
     tool_calls = getattr(message, "tool_calls", None) or []
     if isinstance(tool_calls, list) and tool_calls:
@@ -217,21 +261,18 @@ def _build_llm_content_preview(message: BaseMessage) -> str:
                     "args": tool_call.get("args"),
                 }
             )
-        return _truncate_text(
-            _sanitize(f"tool_calls={json.dumps(compact_calls, ensure_ascii=False)}"),
-            300,
-        )
+        return _render(f"tool_calls={json.dumps(compact_calls, ensure_ascii=False)}")
 
     invalid_tool_calls = getattr(message, "invalid_tool_calls", None) or []
     if isinstance(invalid_tool_calls, list) and invalid_tool_calls:
-        return _truncate_text(_sanitize(f"invalid_tool_calls={invalid_tool_calls}"), 300)
+        return _render(f"invalid_tool_calls={invalid_tool_calls}")
 
     response_metadata = getattr(message, "response_metadata", None) or {}
     finish_reason = ""
     if isinstance(response_metadata, dict):
         finish_reason = str(response_metadata.get("finish_reason", "") or "")
     if finish_reason:
-        return _truncate_text(_sanitize(f"finish_reason={finish_reason}"), 300)
+        return _render(f"finish_reason={finish_reason}")
 
     return "[empty_ai_message]"
 
@@ -411,6 +452,13 @@ class ResearchRunLogger:
                     trim_stats = node_output.get("context_trim_stats")
                 if isinstance(trim_stats, dict):
                     metadata["context_trim"] = trim_stats
+            if isinstance(merged_state, dict):
+                search_guard = merged_state.get("search_guard")
+                if isinstance(search_guard, dict):
+                    metadata["force_end_cycle"] = bool(search_guard.get("force_end_cycle"))
+                    reason_code = str(search_guard.get("last_reason_code", "") or "")
+                    if reason_code:
+                        metadata["guard_reason_code"] = reason_code
             self.log_step(
                 "Tools | Merge",
                 "Tool outputs merged into messages.",
@@ -419,6 +467,13 @@ class ResearchRunLogger:
             return
 
         if node_name == "end_cycle":
+            metadata: Dict[str, Any] = {}
+            if isinstance(merged_state, dict):
+                search_guard = merged_state.get("search_guard")
+                if isinstance(search_guard, dict):
+                    reason_code = str(search_guard.get("last_reason_code", "") or "")
+                    if reason_code:
+                        metadata["guard_reason_code"] = reason_code
             self.payload["trace_data"]["cycle_transitions"].append(
                 {
                     "cycle_id": self.cycle_index,
@@ -426,7 +481,7 @@ class ResearchRunLogger:
                     "timestamp": _now_str(),
                 }
             )
-            self.log_step("Cycle | End", f"Cycle {self.cycle_index} ended.")
+            self.log_step("Cycle | End", f"Cycle {self.cycle_index} ended.", metadata=metadata)
             return
 
         if node_name == "final":
@@ -457,15 +512,18 @@ class ResearchRunLogger:
         latest_ai = _latest_ai_message(node_messages)
         if latest_ai is None and isinstance(node_errors, list) and node_errors:
             last_error = str(node_errors[-1])
+            last_error_full = _sanitize_no_truncate(last_error)
+            if not isinstance(last_error_full, str):
+                last_error_full = str(last_error_full)
             self.payload["trace_data"]["llm_calls"].append(
                 {
                     "timestamp": _now_str(),
                     "usage_metadata": {},
                     "tool_call_count": 0,
-                    "content_preview": _truncate_text(_sanitize(last_error), 300),
+                    "content_preview": last_error_full,
                     "status": "error",
                     "error_count": len(node_errors),
-                    "last_error": _truncate_text(_sanitize(last_error), 300),
+                    "last_error": last_error_full,
                 }
             )
             self.log_step(
@@ -492,7 +550,7 @@ class ResearchRunLogger:
                 "timestamp": _now_str(),
                 "usage_metadata": usage_metadata,
                 "tool_call_count": len(tool_calls),
-                "content_preview": _build_llm_content_preview(latest_ai),
+                "content_preview": _build_llm_content_preview(latest_ai, truncate=False),
                 "status": "success",
             }
         )
@@ -505,8 +563,20 @@ class ResearchRunLogger:
     def _record_tool_requests(self, node_output: Any, merged_state: Dict[str, Any]) -> None:
         requested_calls = []
         messages = []
+        guard_action = ""
+        guard_reason_code = ""
+        guard_invalid_streak = 0
+        guard_overlap_count = 0
         if isinstance(node_output, dict):
             messages = node_output.get("tool_input", [])
+            guard_action = str(node_output.get("guard_action", "") or "")
+            guard_reason_code = str(node_output.get("guard_reason_code", "") or "")
+            invalid_streak_raw = node_output.get("guard_invalid_streak", 0)
+            overlap_count_raw = node_output.get("guard_overlap_count", 0)
+            if isinstance(invalid_streak_raw, int) and invalid_streak_raw >= 0:
+                guard_invalid_streak = invalid_streak_raw
+            if isinstance(overlap_count_raw, int) and overlap_count_raw >= 0:
+                guard_overlap_count = overlap_count_raw
         if not messages:
             state_messages = merged_state.get("messages") or []
             if state_messages:
@@ -524,6 +594,38 @@ class ResearchRunLogger:
                             "args": _sanitize(tool_call.get("args")),
                         }
                     )
+        if guard_action in {"reject_tools", "end_cycle"}:
+            guard_tool_names: list[str] = [c["tool_name"] for c in requested_calls]
+            if not guard_tool_names:
+                for message in messages:
+                    if isinstance(message, ToolMessage):
+                        if message.name:
+                            guard_tool_names.append(str(message.name))
+                            continue
+                        alt_name = (message.additional_kwargs or {}).get("name")
+                        if isinstance(alt_name, str) and alt_name:
+                            guard_tool_names.append(alt_name)
+            if requested_calls:
+                self.payload["trace_data"]["tool_calls"].extend(requested_calls)
+            step_name = "Tools | Guard Exhausted" if guard_action == "end_cycle" else "Tools | Guard Reject"
+            message = (
+                "Query guard reached rejection threshold; ending cycle."
+                if guard_action == "end_cycle"
+                else "Query guard rejected current tool call(s); requesting regeneration."
+            )
+            self.log_step(
+                step_name,
+                message,
+                "warning",
+                metadata={
+                    "tool_names": guard_tool_names,
+                    "reason_code": guard_reason_code,
+                    "invalid_streak": guard_invalid_streak,
+                    "overlap_count": guard_overlap_count,
+                },
+            )
+            return
+
         if requested_calls:
             self.payload["trace_data"]["tool_calls"].extend(requested_calls)
             self.log_step(
