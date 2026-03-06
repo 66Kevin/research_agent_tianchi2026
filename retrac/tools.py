@@ -132,6 +132,16 @@ def _build_guard_rejected_payload(
     }
 
 
+def _is_credit_exhausted_message(text: str) -> bool:
+    lowered = str(text or "").lower()
+    markers = (
+        "not enough credits",
+        "insufficient credits",
+        "insufficient balance",
+    )
+    return any(marker in lowered for marker in markers)
+
+
 def _should_retry(http_status: int | None, status: str) -> bool:
     if status == "TIMEOUT":
         return True
@@ -168,14 +178,20 @@ async def _request_json_with_retry(
                 http_status = response.status
                 body_text = await response.text()
                 if http_status >= 400:
+                    error_message = body_text or f"HTTP {http_status}"
+                    status_name = "HTTP_ERROR"
+                    error_type = "HTTPError"
+                    if _is_credit_exhausted_message(error_message):
+                        status_name = "CREDITS_EXHAUSTED"
+                        error_type = "CreditExhausted"
                     status = _status(
                         ok=False,
-                        status="HTTP_ERROR",
+                        status=status_name,
                         target=target,
                         elapsed_ms=elapsed_ms,
                         http_status=http_status,
-                        error_type="HTTPError",
-                        error_message=body_text or f"HTTP {http_status}",
+                        error_type=error_type,
+                        error_message=error_message,
                     )
                     if attempt < retry_attempts and _should_retry(http_status, status["status"]):
                         last_status = status
@@ -274,14 +290,20 @@ async def _request_text_with_retry(
                 http_status = response.status
                 text = await response.text()
                 if http_status >= 400:
+                    error_message = text or f"HTTP {http_status}"
+                    status_name = "HTTP_ERROR"
+                    error_type = "HTTPError"
+                    if _is_credit_exhausted_message(error_message):
+                        status_name = "CREDITS_EXHAUSTED"
+                        error_type = "CreditExhausted"
                     status = _status(
                         ok=False,
-                        status="HTTP_ERROR",
+                        status=status_name,
                         target=target,
                         elapsed_ms=elapsed_ms,
                         http_status=http_status,
-                        error_type="HTTPError",
-                        error_message=text or f"HTTP {http_status}",
+                        error_type=error_type,
+                        error_message=error_message,
                     )
                     if attempt < retry_attempts and _should_retry(http_status, status["status"]):
                         last_status = status
@@ -489,14 +511,20 @@ async def _summarize_visit_content(webpage_content: str, goal: str) -> Tuple[str
         )
     except openai.APIStatusError as exc:
         elapsed_ms = int((time.perf_counter() - start) * 1000)
+        error_message = str(exc)
+        status_name = "HTTP_ERROR"
+        error_type = type(exc).__name__
+        if _is_credit_exhausted_message(error_message):
+            status_name = "CREDITS_EXHAUSTED"
+            error_type = "CreditExhausted"
         return None, _status(
             ok=False,
-            status="HTTP_ERROR",
+            status=status_name,
             target=target,
             elapsed_ms=elapsed_ms,
             http_status=exc.status_code,
-            error_type=type(exc).__name__,
-            error_message=str(exc),
+            error_type=error_type,
+            error_message=error_message,
         )
     except Exception as exc:  # noqa: BLE001
         elapsed_ms = int((time.perf_counter() - start) * 1000)

@@ -47,6 +47,10 @@ class WebCycleResearchState(TypedDict, total=False):
     guard_reason_code: str
     guard_invalid_streak: int
     guard_overlap_count: int
+    cycle_end_reason: str
+    cycle_end_is_normal: bool
+    cycle_end_detail: Dict[str, Any]
+    cycle_end_ended_by: Literal["graph", "runtime_controller"]
 
 
 def _has_tool_calls(msg: BaseMessage) -> bool:
@@ -80,6 +84,60 @@ def _default_search_guard() -> Dict[str, Any]:
         "force_end_cycle": False,
         "last_reason_code": "",
     }
+
+
+def _classify_cycle_end_reason(
+    state: WebCycleResearchState,
+    domain_cfg: WebCycleResearchConfig,
+) -> tuple[str, bool, Dict[str, Any]]:
+    guard = state.get("search_guard")
+    if isinstance(guard, dict) and bool(guard.get("force_end_cycle")):
+        reason_code = str(guard.get("last_reason_code", "") or "")
+        detail: Dict[str, Any] = {}
+        if reason_code:
+            detail["guard_reason_code"] = reason_code
+        return "search_guard_exhausted", False, detail
+
+    raw_errors = state.get("error")
+    errors = [str(item) for item in raw_errors if item is not None] if isinstance(raw_errors, list) else []
+    if _has_data_inspection_error(errors):
+        return "llm_data_inspection_failed", False, {"last_error": errors[-1] if errors else ""}
+
+    messages = state.get("messages")
+    message_list = messages if isinstance(messages, list) else []
+    last_message = message_list[-1] if message_list else None
+    if isinstance(last_message, AIMessage):
+        raw_usage_metadata = getattr(last_message, "usage_metadata", None)
+        usage_metadata = raw_usage_metadata if isinstance(raw_usage_metadata, dict) else {}
+        max_context = domain_cfg.model.max_context_length
+        total_tokens = usage_metadata.get("total_tokens")
+        if (
+            isinstance(max_context, int)
+            and max_context > 0
+            and isinstance(total_tokens, int)
+            and total_tokens > max_context
+        ):
+            return "max_context_reached", False, {
+                "max_context_length": max_context,
+                "total_tokens": total_tokens,
+            }
+
+        tool_calls_num = sum(1 for message in message_list if isinstance(message, ToolMessage))
+        if tool_calls_num > domain_cfg.max_turns:
+            return "max_turns_reached", False, {
+                "max_turns": domain_cfg.max_turns,
+                "tool_calls_count": tool_calls_num,
+            }
+
+        if not _has_tool_calls(last_message):
+            if errors:
+                return "llm_error_without_response", False, {"last_error": errors[-1]}
+            return "llm_no_tool_calls", True, {}
+
+    if errors:
+        return "llm_error_without_response", False, {"last_error": errors[-1]}
+
+    return "unknown_graph_terminal", False, {}
 
 
 def _normalize_query(text: str) -> str:
@@ -499,6 +557,9 @@ def build_graph(cfg: dict) -> StateGraph:
     async def end_cycle(state: WebCycleResearchState) -> WebCycleResearchState:
         """End a cycle using summary strategy"""
         summary_prompt = domain_cfg.summary_prompt
+        cycle_end_reason, cycle_end_is_normal, cycle_end_detail = _classify_cycle_end_reason(
+            state, domain_cfg
+        )
 
         summary_base_messages = list(state.get("messages", []))
         pending_tool_messages = state.get("tool_input", [])
@@ -551,6 +612,10 @@ def build_graph(cfg: dict) -> StateGraph:
             "messages": state["messages"],
             "tool_input": [],
             "error": state_errors,
+            "cycle_end_reason": cycle_end_reason,
+            "cycle_end_is_normal": cycle_end_is_normal,
+            "cycle_end_detail": cycle_end_detail,
+            "cycle_end_ended_by": "graph",
         }
     
     def cycle_check(state: WebCycleResearchState) -> Literal["final", "start_cycle"]:

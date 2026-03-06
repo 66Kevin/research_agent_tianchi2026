@@ -16,5 +16,5 @@ retrac/.env
 # Runtime logs and outputs
 retrac/logs/
 logs/
-scripts/
 assets/
+scripts/

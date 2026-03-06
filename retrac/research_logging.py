@@ -400,6 +400,64 @@ class ResearchRunLogger:
                 line += f" | metadata={json.dumps(step['metadata'], ensure_ascii=False)}"
             print(line, flush=True)
 
+    def _append_cycle_end_transition(
+        self,
+        *,
+        end_reason: str,
+        is_normal_completion: bool,
+        end_status: str,
+        ended_by: str,
+        reason_detail: Dict[str, Any] | None = None,
+    ) -> None:
+        if self.cycle_index <= 0:
+            return
+
+        transitions = self.payload["trace_data"].setdefault("cycle_transitions", [])
+        if not isinstance(transitions, list):
+            transitions = []
+            self.payload["trace_data"]["cycle_transitions"] = transitions
+
+        for transition in reversed(transitions):
+            if not isinstance(transition, dict):
+                continue
+            transition_cycle_id = transition.get("cycle_id")
+            transition_stage = transition.get("stage")
+            if transition_cycle_id == self.cycle_index and transition_stage == "end":
+                return
+            if transition_cycle_id != self.cycle_index:
+                break
+
+        payload: Dict[str, Any] = {
+            "cycle_id": self.cycle_index,
+            "stage": "end",
+            "timestamp": _now_str(),
+            "is_normal_completion": bool(is_normal_completion),
+            "end_status": str(end_status),
+            "end_reason": str(end_reason),
+            "ended_by": str(ended_by),
+        }
+        if isinstance(reason_detail, dict) and reason_detail:
+            payload["reason_detail"] = _sanitize(reason_detail)
+        transitions.append(payload)
+
+    def record_cycle_interruption(self, reason: str, detail: Dict[str, Any] | None = None) -> None:
+        metadata: Dict[str, Any] = {"end_reason": reason, "ended_by": "runtime_controller"}
+        if isinstance(detail, dict) and detail:
+            metadata["reason_detail"] = detail
+        self._append_cycle_end_transition(
+            end_reason=reason,
+            is_normal_completion=False,
+            end_status="interrupted",
+            ended_by="runtime_controller",
+            reason_detail=detail,
+        )
+        self.log_step(
+            "Cycle | End",
+            f"Cycle {self.cycle_index} interrupted.",
+            info_level="warning",
+            metadata=metadata,
+        )
+
     def log_graph_event(
         self,
         node_name: str,
@@ -468,19 +526,43 @@ class ResearchRunLogger:
 
         if node_name == "end_cycle":
             metadata: Dict[str, Any] = {}
-            if isinstance(merged_state, dict):
+            end_reason = "unknown_graph_terminal"
+            end_is_normal = False
+            ended_by = "graph"
+            reason_detail: Dict[str, Any] = {}
+            if isinstance(node_output, dict):
+                end_reason = str(node_output.get("cycle_end_reason", "") or end_reason)
+                end_is_normal = bool(node_output.get("cycle_end_is_normal", False))
+                ended_by = str(node_output.get("cycle_end_ended_by", "") or ended_by)
+                raw_detail = node_output.get("cycle_end_detail")
+                if isinstance(raw_detail, dict):
+                    reason_detail = dict(raw_detail)
+
+            if not reason_detail and isinstance(merged_state, dict):
                 search_guard = merged_state.get("search_guard")
                 if isinstance(search_guard, dict):
                     reason_code = str(search_guard.get("last_reason_code", "") or "")
                     if reason_code:
-                        metadata["guard_reason_code"] = reason_code
-            self.payload["trace_data"]["cycle_transitions"].append(
+                        reason_detail["guard_reason_code"] = reason_code
+
+            end_status = "normal" if end_is_normal else "forced"
+            self._append_cycle_end_transition(
+                end_reason=end_reason,
+                is_normal_completion=end_is_normal,
+                end_status=end_status,
+                ended_by=ended_by,
+                reason_detail=reason_detail,
+            )
+            metadata.update(
                 {
-                    "cycle_id": self.cycle_index,
-                    "stage": "end",
-                    "timestamp": _now_str(),
+                    "is_normal_completion": end_is_normal,
+                    "end_status": end_status,
+                    "end_reason": end_reason,
+                    "ended_by": ended_by,
                 }
             )
+            if reason_detail:
+                metadata["reason_detail"] = reason_detail
             self.log_step("Cycle | End", f"Cycle {self.cycle_index} ended.", metadata=metadata)
             return
 

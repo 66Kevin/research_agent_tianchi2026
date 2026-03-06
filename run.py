@@ -21,6 +21,12 @@ TASK_FINAL_FALLBACK_S = 597.0
 TASK_HARD_TIMEOUT_S = 600.0
 TOOL_NODE_WATCHDOG_S = 75.0
 FORCED_SUMMARY_MODEL_NAME = "qwen3.5-flash"
+TOOL_API_CREDIT_EXHAUSTION_REASON = "tool_api_not_enough_credits"
+_CREDIT_EXHAUSTION_MARKERS = (
+    "not enough credits",
+    "insufficient credits",
+    "insufficient balance",
+)
 
 
 def extract_boxed_answer(text: str | None) -> str:
@@ -151,6 +157,93 @@ def normalize_messages_for_llm(messages: list[BaseMessage]) -> tuple[list[BaseMe
         "truncated_unmatched_tool_calls": truncated_unmatched_tool_calls,
     }
     return normalized, stats
+
+
+def _is_credit_exhausted_message(text: str | None) -> bool:
+    lowered = str(text or "").lower()
+    return any(marker in lowered for marker in _CREDIT_EXHAUSTION_MARKERS)
+
+
+def _tool_payload_has_credit_exhaustion(payload: Dict[str, Any]) -> tuple[bool, Dict[str, Any]]:
+    tool_name = str(payload.get("tool", "") or "")
+    calls = payload.get("calls")
+    if isinstance(calls, list):
+        for idx, call in enumerate(calls):
+            if not isinstance(call, dict):
+                continue
+            status = str(call.get("status", "") or "")
+            http_status = call.get("http_status")
+            error_message = str(call.get("error_message", "") or "")
+            if status == "CREDITS_EXHAUSTED" or (
+                isinstance(http_status, int)
+                and http_status == 400
+                and _is_credit_exhausted_message(error_message)
+            ):
+                return True, {
+                    "tool_name": tool_name,
+                    "location": f"calls[{idx}]",
+                    "status": status or "HTTP_ERROR",
+                    "http_status": http_status,
+                    "error_message": error_message,
+                    "target": str(call.get("target", "") or ""),
+                }
+
+    summarize_status = payload.get("summarize_status")
+    if isinstance(summarize_status, dict):
+        status = str(summarize_status.get("status", "") or "")
+        http_status = summarize_status.get("http_status")
+        error_message = str(summarize_status.get("error_message", "") or "")
+        if status == "CREDITS_EXHAUSTED" or (
+            isinstance(http_status, int)
+            and http_status == 400
+            and _is_credit_exhausted_message(error_message)
+        ):
+            return True, {
+                "tool_name": tool_name,
+                "location": "summarize_status",
+                "status": status or "HTTP_ERROR",
+                "http_status": http_status,
+                "error_message": error_message,
+                "target": str(summarize_status.get("target", "") or ""),
+            }
+
+    return False, {}
+
+
+def _detect_credit_exhaustion_from_tools_node(node_output: Any) -> tuple[bool, Dict[str, Any]]:
+    if not isinstance(node_output, dict):
+        return False, {}
+    tool_messages = node_output.get("tool_input")
+    if not isinstance(tool_messages, list):
+        return False, {}
+
+    for tool_message in tool_messages:
+        if not isinstance(tool_message, ToolMessage):
+            continue
+        content_text = message_to_text(tool_message)
+        try:
+            payload = json.loads(content_text)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+
+        hit, detail = _tool_payload_has_credit_exhaustion(payload)
+        if not hit:
+            continue
+
+        if not detail.get("tool_name"):
+            detail["tool_name"] = str(
+                getattr(tool_message, "name", None)
+                or (tool_message.additional_kwargs or {}).get("name")
+                or ""
+            )
+        tool_call_id = getattr(tool_message, "tool_call_id", None)
+        if isinstance(tool_call_id, str) and tool_call_id:
+            detail["tool_call_id"] = tool_call_id
+        return True, detail
+
+    return False, {}
 
 
 def extract_last_completed_cycle_answer(state: Dict[str, Any]) -> str:
@@ -370,6 +463,18 @@ async def execute_task(
     last_node_name = ""
     last_node_ts = start_time
 
+    async def _close_event_iter() -> None:
+        nonlocal event_iter_closed
+        if event_iter_closed:
+            return
+        aclose = getattr(event_iter, "aclose", None)
+        if callable(aclose):
+            try:
+                await aclose()
+            except Exception:  # noqa: BLE001
+                pass
+        event_iter_closed = True
+
     try:
         timeout_trigger = ""
         force_end_cycle = False
@@ -437,6 +542,47 @@ async def execute_task(
                 last_node_name = node_name
                 last_node_ts = time.perf_counter()
 
+                if node_name == "tools":
+                    credits_exhausted, credit_detail = _detect_credit_exhaustion_from_tools_node(node_output)
+                    if credits_exhausted:
+                        abort_message = (
+                            "Task aborted due to tool API credit exhaustion"
+                            f" ({credit_detail.get('tool_name') or 'unknown tool'})"
+                        )
+                        state_errors_raw = merged_state.get("error", [])
+                        state_errors = (
+                            list(state_errors_raw) if isinstance(state_errors_raw, list) else []
+                        )
+                        detail_message = str(credit_detail.get("error_message", "") or "")
+                        if detail_message:
+                            state_errors.append(
+                                f"{abort_message}: {detail_message}"
+                            )
+                        else:
+                            state_errors.append(abort_message)
+                        merged_state["error"] = state_errors
+                        merged_state["abort_reason"] = TOOL_API_CREDIT_EXHAUSTION_REASON
+
+                        if cycle_open:
+                            logger.record_cycle_interruption(
+                                reason=TOOL_API_CREDIT_EXHAUSTION_REASON,
+                                detail=credit_detail,
+                            )
+                            cycle_open = False
+
+                        logger.log_step(
+                            "Main | Abort",
+                            abort_message,
+                            info_level="error",
+                            metadata={
+                                "abort_reason": TOOL_API_CREDIT_EXHAUSTION_REASON,
+                                "detail": credit_detail,
+                            },
+                        )
+                        await _close_event_iter()
+                        logger.finalize_error(abort_message, merged_state)
+                        return False, merged_state, time.perf_counter() - start_time
+
             if stream_messages:
                 messages: list[BaseMessage] = merged_state.get("messages", [])
                 for msg in messages:
@@ -447,6 +593,21 @@ async def execute_task(
                     seen_messages.add(msg_hash)
 
         if force_end_cycle:
+            if cycle_open:
+                runtime_reason = (
+                    "runtime_tools_watchdog"
+                    if force_end_trigger == "tools_watchdog"
+                    else "runtime_time_window"
+                )
+                logger.record_cycle_interruption(
+                    reason=runtime_reason,
+                    detail={
+                        "trigger_reason": force_end_trigger or "unknown",
+                        "elapsed_seconds": round(time.perf_counter() - start_time, 3),
+                    },
+                )
+                cycle_open = False
+
             if force_end_trigger == "tools_watchdog":
                 logger.log_step(
                     "Main | Tools Watchdog",
@@ -472,13 +633,7 @@ async def execute_task(
                 },
             )
 
-            aclose = getattr(event_iter, "aclose", None)
-            if callable(aclose):
-                try:
-                    await aclose()
-                except Exception:  # noqa: BLE001
-                    pass
-                event_iter_closed = True
+            await _close_event_iter()
 
             elapsed = time.perf_counter() - start_time
             summary_budget_s = TASK_FINAL_FALLBACK_S - elapsed
@@ -539,6 +694,21 @@ async def execute_task(
             return True, merged_state, time.perf_counter() - start_time
 
         if timeout_trigger:
+            if cycle_open:
+                timeout_reason = (
+                    "runtime_hard_timeout_before_next_event"
+                    if timeout_trigger == "hard_timeout_before_next_event"
+                    else "runtime_hard_timeout_waiting_next_event"
+                )
+                logger.record_cycle_interruption(
+                    reason=timeout_reason,
+                    detail={
+                        "trigger_reason": timeout_trigger,
+                        "elapsed_seconds": round(time.perf_counter() - start_time, 3),
+                    },
+                )
+                cycle_open = False
+
             fallback_answer = apply_timeout_fallback(merged_state)
             logger.log_step(
                 "Main | Timeout Fallback",
@@ -564,12 +734,7 @@ async def execute_task(
         return False, merged_state, time.perf_counter() - start_time
     finally:
         if not event_iter_closed:
-            aclose = getattr(event_iter, "aclose", None)
-            if callable(aclose):
-                try:
-                    await aclose()
-                except Exception:  # noqa: BLE001
-                    pass
+            await _close_event_iter()
 
 
 async def run_single_task(
@@ -688,6 +853,11 @@ async def run_batch_tasks(
                 failed_count += 1
                 error_text = state.get("error", "unknown error")
                 print(f"[task {task_id}] failed: {error_text}")
+                if state.get("abort_reason") == TOOL_API_CREDIT_EXHAUSTION_REASON:
+                    print(
+                        "[batch] stopped early due to tool API credit exhaustion."
+                    )
+                    break
 
     print(
         f"Batch completed. total={total_count}, success={success_count}, failed={failed_count}, log_dir={run_dir}"
