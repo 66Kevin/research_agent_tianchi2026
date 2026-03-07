@@ -10,3 +10,7 @@ max_tokens: 4096
 api_key: ""
 base_url: https://api.anthropic.com
 repetition_penalty: 1.0
+temperature_overrides:
+  main_agent: null
+  final_summary: null
+  jina_summary: null

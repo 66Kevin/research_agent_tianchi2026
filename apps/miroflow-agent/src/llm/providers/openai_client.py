@@ -237,6 +237,7 @@ class OpenAIClient(BaseClient):
         messages_history: List[Dict[str, Any]],
         tools_definitions,
         keep_tool_result: int = -1,
+        temperature_override: float | None = None,
     ):
         """
         Send message to OpenAI API.
@@ -244,6 +245,20 @@ class OpenAIClient(BaseClient):
         :param messages_history: Message history list.
         :return: OpenAI API response object or None (if error occurs).
         """
+        active_temperature = (
+            temperature_override
+            if temperature_override is not None
+            else self.temperature
+        )
+
+        self.task_log.log_step(
+            "info",
+            "LLM | Call Start",
+            (
+                f"Calling LLM ({'async' if self.async_client else 'sync'}) "
+                f"with temperature={active_temperature}"
+            ),
+        )
 
         # Create a copy for sending to LLM (to avoid modifying the original)
         messages_for_llm = [m.copy() for m in messages_history]
@@ -288,7 +303,7 @@ class OpenAIClient(BaseClient):
         for attempt in range(max_retries):
             params = {
                 "model": self.model_name,
-                "temperature": self.temperature,
+                "temperature": active_temperature,
                 "messages": messages_for_llm,
                 "stream": use_stream,
                 "top_p": self.top_p,

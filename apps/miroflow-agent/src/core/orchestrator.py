@@ -34,6 +34,7 @@ from ..utils.prompt_utils import (
     mcp_tags,
     refusal_keywords,
 )
+from ..utils.temperature_utils import resolve_temperature
 from .answer_generator import AnswerGenerator
 from .stream_handler import StreamHandler
 from .tool_executor import ToolExecutor
@@ -561,6 +562,7 @@ class Orchestrator:
         max_attempts = max_turns + EXTRA_ATTEMPTS_BUFFER
         consecutive_rollbacks = 0
         web_tool_calls = 0
+        active_main_temperature = resolve_temperature(self.cfg, "main_agent")
 
         while turn_count < max_turns and total_attempts < max_attempts:
             turn_count += 1
@@ -596,6 +598,7 @@ class Orchestrator:
                     turn_count,
                     f"{sub_agent_name} | Turn: {turn_count}",
                     agent_type=sub_agent_name,
+                    temperature_override=active_main_temperature,
                 )
             except PolicyBlockedError:
                 await self.stream.end_llm(display_name)
@@ -944,6 +947,7 @@ class Orchestrator:
                 turn_count + 1,
                 f"{sub_agent_name} | Final summary",
                 agent_type=sub_agent_name,
+                temperature_override=active_main_temperature,
             )
         except PolicyBlockedError:
             await self.stream.end_llm(display_name)
@@ -1063,6 +1067,7 @@ class Orchestrator:
         max_attempts = max_turns + EXTRA_ATTEMPTS_BUFFER
         consecutive_rollbacks = 0
         web_tool_calls = 0
+        active_main_temperature = resolve_temperature(self.cfg, "main_agent")
         task_timeout_seconds = float(
             self.cfg.benchmark.execution.get("task_timeout_seconds", 0)
         )
@@ -1118,6 +1123,7 @@ class Orchestrator:
                     turn_count,
                     f"Main agent | Turn: {turn_count}",
                     agent_type="main",
+                    temperature_override=active_main_temperature,
                 )
             except PolicyBlockedError as e:
                 return await self._handle_policy_blocked(

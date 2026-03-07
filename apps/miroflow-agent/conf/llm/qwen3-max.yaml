@@ -11,6 +11,10 @@ max_tokens: 16384
 top_p: 0.95
 repetition_penalty: 1.05
 temperature: 1.0
+temperature_overrides:
+  main_agent: 0.4
+  final_summary: 0.2
+  jina_summary: 0.2
 api_key: "${oc.env:DASHSCOPE_API_KEY}"
 timeout_seconds: 120
 max_retries: 2

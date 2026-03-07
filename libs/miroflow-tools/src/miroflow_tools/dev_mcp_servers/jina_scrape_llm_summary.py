@@ -16,6 +16,7 @@ logger = logging.getLogger("miroflow")
 SUMMARY_LLM_BASE_URL = os.environ.get("SUMMARY_LLM_BASE_URL")
 SUMMARY_LLM_MODEL_NAME = os.environ.get("SUMMARY_LLM_MODEL_NAME")
 SUMMARY_LLM_API_KEY = os.environ.get("SUMMARY_LLM_API_KEY")
+SUMMARY_LLM_TEMPERATURE = os.environ.get("SUMMARY_LLM_TEMPERATURE")
 
 JINA_API_KEY = os.environ.get("JINA_API_KEY", "")
 JINA_BASE_URL = os.environ.get("JINA_BASE_URL", "https://r.jina.ai")
@@ -23,25 +24,45 @@ JINA_BASE_URL = os.environ.get("JINA_BASE_URL", "https://r.jina.ai")
 # Initialize FastMCP server
 mcp = FastMCP("jina_scrape_llm_summary")
 
+NOT_FOUND_SUMMARY = "NOT_FOUND"
+NOT_FOUND_RATIONAL = "Target not found in the provided webpage content."
+FALLBACK_RATIONAL = (
+    "Fallback normalization applied because the model did not return valid JSON."
+)
+
+
+def _get_summary_llm_temperature(default: float = 1.0) -> float:
+    """Parse the configured summary LLM temperature with safe fallback."""
+    if not SUMMARY_LLM_TEMPERATURE or not SUMMARY_LLM_TEMPERATURE.strip():
+        return default
+
+    try:
+        return float(SUMMARY_LLM_TEMPERATURE)
+    except ValueError:
+        return default
+
 
 @mcp.tool()
 async def scrape_and_extract_info(
     url: str, info_to_extract: str, custom_headers: Dict[str, str] = None
 ):
     """
-    Scrape content from a URL, including web pages, PDFs, code files, and other supported resources, and extract meaningful information using an LLM.
+    Scrape content from a URL, including web pages, PDFs, code files, and other
+    supported resources, then extract target-specific information using an LLM.
     If you need to extract information from a PDF, please use this tool.
 
     Args:
         url (str): The URL to scrape content from. Supports various types of URLs such as web pages, PDFs, raw text/code files (e.g., GitHub, Gist), and similar sources.
-        info_to_extract (str): The specific types of information to extract (usually a question)
+        info_to_extract (str): The visit target for this page. Use a precise sub-question
+            rather than a generic summary request.
         custom_headers (Dict[str, str]): Additional headers to include in the scraping request
 
     Returns:
         Dict[str, Any]: A dictionary containing:
             - success (bool): Whether the operation was successful
             - url (str): The original URL
-            - extracted_info (str): The extracted information
+            - extracted_info (str): A JSON string with `rational`, `evidence`, and
+              `summary` fields
             - error (str): Error message if the operation failed
             - scrape_stats (Dict): Statistics about the scraped content
             - model_used (str): The model used for summarization
@@ -90,7 +111,7 @@ async def scrape_and_extract_info(
                 f"Jina Scrape and Extract Info: Python fallback scraping succeeded for URL: {url}"
             )
 
-    # Then, summarize the content
+    # Then, extract target-specific information from the content
     extracted_result = await extract_info_with_llm(
         url=url,
         content=scrape_result["content"],
@@ -556,22 +577,86 @@ async def scrape_url_with_python(
     }
 
 
-EXTRACT_INFO_PROMPT = """You are given a piece of content and the requirement of information to extract. Your task is to extract the information specifically requested. Be precise and focus exclusively on the requested information.
+EXTRACT_INFO_PROMPT = """Please process the following webpage content and user goal to extract relevant information:
 
-INFORMATION TO EXTRACT:
-{}
+## Webpage Content
+{webpage_content}
 
-INSTRUCTIONS:
-1. Extract the information relevant to the focus above.
-2. If the exact information is not found, extract the most closely related details.
-3. Be specific and include exact details when available.
-4. Clearly organize the extracted information for easy understanding.
-5. Do not include general summaries or unrelated content.
+## User Goal
+{goal}
 
-CONTENT TO ANALYZE:
-{}
+## Task Guidelines
+1. Content Scanning for `rational`: locate the sections or data directly related to the user goal.
+2. Key Extraction for Evidence: extract the most relevant original context and preserve the original wording as much as possible.
+3. Summary Output: write a concise answer-focused summary with logical flow.
+4. If the page does not contain enough information to answer the goal, do not infer. Return `summary` as `NOT_FOUND`.
+5. Output valid JSON only with keys `rational`, `evidence`, and `summary`.
+6. Do not include markdown fences, extra commentary, or unrelated page summary.
 
-EXTRACTED INFORMATION:"""
+Output schema:
+{{
+  "rational": "...",
+  "evidence": ["...", "..."],
+  "summary": "..."
+}}"""
+
+
+def _build_not_found_payload() -> Dict[str, Any]:
+    return {
+        "rational": NOT_FOUND_RATIONAL,
+        "evidence": [],
+        "summary": NOT_FOUND_SUMMARY,
+    }
+
+
+def normalize_extracted_info(raw_output: str) -> str:
+    """Normalize LLM output into the strict extracted-info JSON contract."""
+    text = (raw_output or "").strip()
+
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        if NOT_FOUND_SUMMARY in text.upper():
+            normalized = _build_not_found_payload()
+        else:
+            normalized = {
+                "rational": FALLBACK_RATIONAL,
+                "evidence": [],
+                "summary": text,
+            }
+        return json.dumps(normalized, ensure_ascii=False)
+
+    if not isinstance(parsed, dict):
+        normalized = {
+            "rational": FALLBACK_RATIONAL,
+            "evidence": [],
+            "summary": text,
+        }
+        return json.dumps(normalized, ensure_ascii=False)
+
+    rational = str(parsed.get("rational", "") or "").strip()
+    summary = str(parsed.get("summary", "") or "").strip()
+    evidence = parsed.get("evidence", [])
+
+    if isinstance(evidence, str):
+        evidence = [evidence]
+    elif isinstance(evidence, list):
+        evidence = [str(item).strip() for item in evidence if str(item).strip()]
+    elif evidence:
+        evidence = [str(evidence).strip()]
+    else:
+        evidence = []
+
+    if summary.upper() == NOT_FOUND_SUMMARY:
+        normalized = _build_not_found_payload()
+    else:
+        normalized = {
+            "rational": rational,
+            "evidence": evidence,
+            "summary": summary,
+        }
+
+    return json.dumps(normalized, ensure_ascii=False)
 
 
 def get_prompt_with_truncation(
@@ -581,7 +666,10 @@ def get_prompt_with_truncation(
         content = content[:-truncate_last_num_chars] + "[...truncated]"
 
     # Prepare the prompt
-    prompt = EXTRACT_INFO_PROMPT.format(info_to_extract, content)
+    prompt = EXTRACT_INFO_PROMPT.format(
+        webpage_content=content,
+        goal=info_to_extract,
+    )
     return prompt
 
 
@@ -593,18 +681,19 @@ async def extract_info_with_llm(
     max_tokens: int = 4096,
 ) -> Dict[str, Any]:
     """
-    Summarize content using an LLM API.
+    Extract target-specific information from scraped content using an LLM.
 
     Args:
-        content (str): The content to summarize
-        info_to_extract (str): The specific types of information to extract (usually a question)
-        model (str): The model to use for summarization
+        content (str): The scraped page content to analyze
+        info_to_extract (str): The visit target for this page
+        model (str): The model to use for targeted extraction
         max_tokens (int): Maximum tokens for the response
 
     Returns:
         Dict[str, Any]: A dictionary containing:
             - success (bool): Whether the operation was successful
-            - extracted_info (str): The extracted information
+            - extracted_info (str): A JSON string with `rational`, `evidence`, and
+              `summary`
             - error (str): Error message if the operation failed
             - model_used (str): The model used for summarization
             - tokens_used (int): Number of tokens used (if available)
@@ -623,6 +712,12 @@ async def extract_info_with_llm(
     prompt = get_prompt_with_truncation(info_to_extract, content)
 
     # Prepare the payload
+    active_temperature = _get_summary_llm_temperature()
+    logger.info(
+        "Jina Scrape and Extract Info: Using summary LLM temperature=%s",
+        active_temperature,
+    )
+
     if "gpt" in model:
         payload = {
             "model": model,
@@ -630,6 +725,7 @@ async def extract_info_with_llm(
             "messages": [
                 {"role": "user", "content": prompt},
             ],
+            "temperature": active_temperature,
         }
         # Add cost-saving parameters for GPT-5 models
         if "gpt-5" in model.lower() or "gpt5" in model.lower():
@@ -642,7 +738,7 @@ async def extract_info_with_llm(
             "messages": [
                 {"role": "user", "content": prompt},
             ],
-            "temperature": 1.0,
+            "temperature": active_temperature,
             # "top_p": 0.8,
             # "top_k": 20,
         }
@@ -833,7 +929,7 @@ async def extract_info_with_llm(
 
         return {
             "success": True,
-            "extracted_info": summary,
+            "extracted_info": normalize_extracted_info(summary),
             "error": "",
             "model_used": model,
             "tokens_used": tokens_used,

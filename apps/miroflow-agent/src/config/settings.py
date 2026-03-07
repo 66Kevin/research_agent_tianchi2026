@@ -18,6 +18,8 @@ from dotenv import load_dotenv
 from mcp import StdioServerParameters
 from omegaconf import DictConfig
 
+from ..utils.temperature_utils import resolve_temperature
+
 # Load environment variables from .env file
 load_dotenv()
 
@@ -310,6 +312,7 @@ def create_mcp_server_parameters(cfg: DictConfig, agent_cfg: DictConfig):
         agent_cfg.get("tools", None) is not None
         and "jina_scrape_llm_summary" in agent_cfg["tools"]
     ):
+        summary_llm_temperature = str(resolve_temperature(cfg, "jina_summary"))
         configs.append(
             {
                 "name": "jina_scrape_llm_summary",
@@ -325,6 +328,7 @@ def create_mcp_server_parameters(cfg: DictConfig, agent_cfg: DictConfig):
                         "SUMMARY_LLM_BASE_URL": SUMMARY_LLM_BASE_URL,
                         "SUMMARY_LLM_MODEL_NAME": SUMMARY_LLM_MODEL_NAME,
                         "SUMMARY_LLM_API_KEY": SUMMARY_LLM_API_KEY,
+                        "SUMMARY_LLM_TEMPERATURE": summary_llm_temperature,
                     },
                 ),
             }
@@ -440,6 +444,9 @@ def get_env_info(cfg: DictConfig) -> dict:
         "llm_base_url": cfg.llm.base_url,
         "llm_model_name": cfg.llm.model_name,
         "llm_temperature": cfg.llm.temperature,
+        "llm_temperature_main_agent": resolve_temperature(cfg, "main_agent"),
+        "llm_temperature_final_summary": resolve_temperature(cfg, "final_summary"),
+        "llm_temperature_jina_summary": resolve_temperature(cfg, "jina_summary"),
         "llm_top_p": cfg.llm.top_p,
         "llm_min_p": cfg.llm.min_p,
         "llm_top_k": cfg.llm.top_k,

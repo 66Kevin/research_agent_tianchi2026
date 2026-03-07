@@ -27,6 +27,7 @@ from ..utils.prompt_utils import (
     FORMAT_ERROR_MESSAGE,
     generate_agent_summarize_prompt,
 )
+from ..utils.temperature_utils import resolve_temperature
 from ..utils.wrapper_utils import ErrorBox, ResponseBox
 from .stream_handler import StreamHandler
 
@@ -85,6 +86,7 @@ class AnswerGenerator:
         step_id: int,
         purpose: str = "",
         agent_type: str = "main",
+        temperature_override: Optional[float] = None,
     ) -> Tuple[Optional[str], bool, Optional[Any], List[Dict[str, Any]]]:
         """
         Unified LLM call and logging processing.
@@ -96,11 +98,17 @@ class AnswerGenerator:
             step_id: Current step ID for logging
             purpose: Description of the call purpose
             agent_type: Type of agent making the call
+            temperature_override: Optional per-call temperature override
 
         Returns:
             Tuple of (response_text, should_break, tool_calls_info, message_history)
         """
         original_message_history = message_history
+        active_temperature = (
+            float(temperature_override)
+            if temperature_override is not None
+            else resolve_temperature(self.cfg, "main_agent")
+        )
         try:
             response, message_history = await self.llm_client.create_message(
                 system_prompt=system_prompt,
@@ -110,6 +118,7 @@ class AnswerGenerator:
                 step_id=step_id,
                 task_log=self.task_log,
                 agent_type=agent_type,
+                temperature_override=active_temperature,
             )
 
             if ErrorBox.is_error_box(response):
@@ -232,6 +241,7 @@ class AnswerGenerator:
             turn_count + 10,  # Use a different step id
             "Main Agent | Failure Experience Summary",
             agent_type="main",
+            temperature_override=resolve_temperature(self.cfg, "final_summary"),
         )
 
         # Prepend the assistant prefix to the response for complete output
@@ -309,6 +319,7 @@ class AnswerGenerator:
                 turn_count + 1 + retry_idx,
                 f"Main agent | Final Summary (attempt {retry_idx + 1}/{self.max_final_answer_retries})",
                 agent_type="main",
+                temperature_override=resolve_temperature(self.cfg, "final_summary"),
             )
 
             if final_answer_text:

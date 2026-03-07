@@ -104,6 +104,7 @@ class AnthropicClient(BaseClient):
         messages_history: List[Dict[str, Any]],
         tools_definitions,
         keep_tool_result: int = -1,
+        temperature_override: float | None = None,
     ):
         """
         Send message to Anthropic API.
@@ -111,10 +112,19 @@ class AnthropicClient(BaseClient):
         :param messages_history: Message history list.
         :return: Anthropic API response object or None (if error occurs).
         """
+        active_temperature = (
+            temperature_override
+            if temperature_override is not None
+            else self.temperature
+        )
+
         self.task_log.log_step(
             "info",
             "LLM | Call Start",
-            f"Calling LLM ({'async' if self.async_client else 'sync'})",
+            (
+                f"Calling LLM ({'async' if self.async_client else 'sync'}) "
+                f"with temperature={active_temperature}"
+            ),
         )
 
         # Create a filtered copy for sending to LLM (to save tokens)
@@ -131,7 +141,7 @@ class AnthropicClient(BaseClient):
             if self.async_client:
                 response = await self.client.messages.create(
                     model=self.model_name,
-                    temperature=self.temperature,
+                    temperature=active_temperature,
                     top_p=self.top_p if self.top_p != 1.0 else NOT_GIVEN,
                     top_k=self.top_k if self.top_k != -1 else NOT_GIVEN,
                     max_tokens=self.max_tokens,
@@ -148,7 +158,7 @@ class AnthropicClient(BaseClient):
             else:
                 response = self.client.messages.create(
                     model=self.model_name,
-                    temperature=self.temperature,
+                    temperature=active_temperature,
                     top_p=self.top_p if self.top_p != 1.0 else NOT_GIVEN,
                     top_k=self.top_k if self.top_k != -1 else NOT_GIVEN,
                     max_tokens=self.max_tokens,

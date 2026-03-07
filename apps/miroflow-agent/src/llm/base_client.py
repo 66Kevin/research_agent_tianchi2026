@@ -228,6 +228,7 @@ class BaseClient(ABC):
         step_id: int = 1,
         task_log: Optional["TaskLog"] = None,
         agent_type: str = "main",
+        temperature_override: Optional[float] = None,
     ) -> Tuple[Any, List[Dict]]:
         """
         Call LLM to generate a response with optional tool call support.
@@ -245,6 +246,7 @@ class BaseClient(ABC):
             step_id: Current step identifier for logging
             task_log: Optional logger for task execution
             agent_type: Type of agent making the call ("main" or sub-agent name)
+            temperature_override: Optional per-call temperature override
 
         Returns:
             Tuple of (response, updated_message_history)
@@ -261,6 +263,7 @@ class BaseClient(ABC):
                     message_history,
                     tool_definitions,
                     keep_tool_result=keep_tool_result,
+                    temperature_override=temperature_override,
                 ),
                 timeout=timeout_seconds,
             )
