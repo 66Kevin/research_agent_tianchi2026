@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import re
-from typing import Optional
+from typing import Literal, Optional
 
 
 NAMED_ENTITY_TYPES = {
@@ -31,6 +31,8 @@ LOCALIZATION_STATUS_VALUES = {
     "skip_original_requested",
     "not_applicable",
 }
+LOCALIZATION_GATE_MODE_VALUES = {"full", "degraded", "skip"}
+LocalizationGateMode = Literal["full", "degraded", "skip"]
 
 
 @dataclass(frozen=True)
@@ -47,6 +49,56 @@ class LocalizationGateDecision:
     @property
     def is_named_entity(self) -> bool:
         return self.entity_type in NAMED_ENTITY_TYPES
+
+
+@dataclass(frozen=True)
+class LocalizationGateBudgetDecision:
+    mode: LocalizationGateMode
+    remaining_seconds: float
+    reason: str
+
+
+def decide_localization_gate_mode_from_remaining(
+    remaining_seconds: float,
+    final_summary_reserve_seconds: float,
+    full_min_remaining_seconds: float,
+    degraded_min_remaining_seconds: float,
+) -> LocalizationGateBudgetDecision:
+    """Decide full/degraded/skip gate mode from remaining task time."""
+
+    full_threshold = max(0.0, final_summary_reserve_seconds) + max(
+        0.0, full_min_remaining_seconds
+    )
+    degraded_threshold = max(0.0, final_summary_reserve_seconds) + max(
+        0.0, degraded_min_remaining_seconds
+    )
+
+    if remaining_seconds >= full_threshold:
+        return LocalizationGateBudgetDecision(
+            mode="full",
+            remaining_seconds=remaining_seconds,
+            reason=(
+                f"Remaining time {remaining_seconds:.1f}s >= full gate threshold "
+                f"{full_threshold:.1f}s."
+            ),
+        )
+    if remaining_seconds >= degraded_threshold:
+        return LocalizationGateBudgetDecision(
+            mode="degraded",
+            remaining_seconds=remaining_seconds,
+            reason=(
+                f"Remaining time {remaining_seconds:.1f}s is below full gate threshold "
+                f"{full_threshold:.1f}s but >= degraded threshold {degraded_threshold:.1f}s."
+            ),
+        )
+    return LocalizationGateBudgetDecision(
+        mode="skip",
+        remaining_seconds=remaining_seconds,
+        reason=(
+            f"Remaining time {remaining_seconds:.1f}s is below degraded gate threshold "
+            f"{degraded_threshold:.1f}s."
+        ),
+    )
 
 
 def should_run_localization_gate(

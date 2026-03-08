@@ -17,3 +17,5 @@ execution:
   task_timeout_seconds: 600
   localization_gate_reserve_seconds: 30
   final_summary_reserve_seconds: 40
+  localization_gate_full_min_remaining_seconds: 20
+  localization_gate_degraded_min_remaining_seconds: 8

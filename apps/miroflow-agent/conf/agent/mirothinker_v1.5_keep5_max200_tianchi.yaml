@@ -16,7 +16,7 @@ main_agent:
   web_tool_call_hard_limit: 100
   localization_gate_enabled: true
   localization_gate_max_tool_calls: 2
-  localization_gate_min_remaining_seconds: 5
+  localization_gate_degraded_max_tool_calls: 1
   system_prompt_skill: |
     Tianchi stage-1 research agent evidence-first execution skill:
     - Before any tool call, extract the expected answer type, language, exact output format, and the minimum evidence needed to justify the answer.

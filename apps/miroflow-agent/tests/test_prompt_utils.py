@@ -20,6 +20,9 @@ def test_main_agent_summarize_prompt_uses_three_step_normalization_rules():
     assert "official original/native full form" in prompt
     assert "Localization Gate Result" in prompt
     assert "authoritative localization status" in prompt
+    assert "localized_name_status: NOT_FOUND" in prompt
+    assert "use `verified_original_full_name` rather than compressing to a shorter brand" in prompt
+    assert "Do not prefer a shorter brand-style rendering" in prompt
     assert "usually first name + last name" in prompt
     assert "Do not automatically include a middle name" in prompt
     assert "cannot perform any new search" in prompt
@@ -61,6 +64,20 @@ def test_localization_gate_prompt_limits_scope_and_tools():
     assert "at most 2 tool calls" in prompt
     assert "first name + last name" in prompt
     assert "Do not automatically include middle names" in prompt
+
+
+def test_degraded_localization_gate_prompt_limits_to_one_tool_call():
+    prompt = generate_localization_gate_prompt(
+        task_description="请给出该出版社的中文全称。",
+        candidate_answer="Arnoldo Mondadori Editore",
+        entity_type="publisher",
+        question_language="zh",
+        mode="degraded",
+    )
+
+    assert "Degraded Pre-Summary Localization Gate" in prompt
+    assert "at most 1 tool call" in prompt
+    assert "Time is limited." in prompt
 
 
 def test_localization_gate_result_prompt_requests_structured_result_block():

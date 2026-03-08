@@ -28,7 +28,9 @@ from ..llm.errors import PolicyBlockedError
 from ..logging.task_logger import TaskLog, get_utc_plus_8_time
 from ..utils.parsing_utils import extract_llm_response_text
 from ..utils.localization_gate_utils import (
+    LocalizationGateBudgetDecision,
     LocalizationGateDecision,
+    decide_localization_gate_mode_from_remaining,
     parse_localization_gate_decision,
     should_run_localization_gate,
 )
@@ -578,6 +580,37 @@ class Orchestrator:
     ) -> bool:
         return should_run_localization_gate(decision)
 
+    def _decide_localization_gate_mode(
+        self,
+        task_deadline: Optional[float],
+        final_summary_reserve_seconds: float,
+    ) -> LocalizationGateBudgetDecision:
+        """Choose full, degraded, or skip mode based on remaining task time."""
+        if task_deadline is None:
+            return LocalizationGateBudgetDecision(
+                mode="full",
+                remaining_seconds=float("inf"),
+                reason="Task deadline is not configured; defaulting to full gate.",
+            )
+
+        remaining_seconds = task_deadline - time.time()
+        full_min_remaining_seconds = float(
+            self.cfg.benchmark.execution.get(
+                "localization_gate_full_min_remaining_seconds", 20
+            )
+        )
+        degraded_min_remaining_seconds = float(
+            self.cfg.benchmark.execution.get(
+                "localization_gate_degraded_min_remaining_seconds", 8
+            )
+        )
+        return decide_localization_gate_mode_from_remaining(
+            remaining_seconds=remaining_seconds,
+            final_summary_reserve_seconds=final_summary_reserve_seconds,
+            full_min_remaining_seconds=full_min_remaining_seconds,
+            degraded_min_remaining_seconds=degraded_min_remaining_seconds,
+        )
+
     async def _run_localization_gate_decision(
         self,
         system_prompt: str,
@@ -752,6 +785,7 @@ class Orchestrator:
         task_description: str,
         decision: LocalizationGateDecision,
         turn_count: int,
+        gate_mode: str = "full",
     ) -> Optional[str]:
         """Generate the authoritative localization gate result block."""
         result_history = [message.copy() for message in message_history]
@@ -762,6 +796,7 @@ class Orchestrator:
                     task_description,
                     decision.candidate_answer,
                     decision.entity_type,
+                    gate_mode=gate_mode,
                 ),
             }
         )
@@ -800,6 +835,59 @@ class Orchestrator:
 
         return cleaned_text
 
+    @staticmethod
+    def _build_fallback_localization_gate_result_text(
+        decision: LocalizationGateDecision,
+        gate_mode: str,
+        notes: str,
+    ) -> str:
+        """Construct a deterministic fallback localization gate result block."""
+        normalized_question_language = decision.question_language or "unknown"
+        original_name_requested = "yes" if decision.original_name_requested else "no"
+        verified_original_full_name = decision.candidate_answer or ""
+        source_quality = "weak" if gate_mode == "skip" else "mixed"
+        source_basis = (
+            "Localization gate skipped before tool use."
+            if gate_mode == "skip"
+            else "Localization gate completed without a usable structured result."
+        )
+
+        return (
+            "Localization Gate Result\n"
+            f"- candidate_answer: {decision.candidate_answer}\n"
+            f"- entity_type: {decision.entity_type}\n"
+            f"- question_language: {normalized_question_language}\n"
+            f"- original_name_requested: {original_name_requested}\n"
+            "- localized_name_status: NOT_FOUND\n"
+            "- localized_form_in_question_language: \n"
+            f"- verified_original_full_name: {verified_original_full_name}\n"
+            f"- source_basis: {source_basis}\n"
+            f"- source_quality: {source_quality}\n"
+            f"- notes: {notes}\n"
+        )
+
+    def _append_skip_localization_gate_result(
+        self,
+        system_prompt: str,
+        message_history: List[Dict[str, Any]],
+        decision: LocalizationGateDecision,
+        notes: str,
+    ) -> List[Dict[str, Any]]:
+        """Append a structured NOT_FOUND result block when the gate is skipped."""
+        fallback_text = self._build_fallback_localization_gate_result_text(
+            decision=decision,
+            gate_mode="skip",
+            notes=notes,
+        )
+        message_history.append({"role": "assistant", "content": fallback_text})
+        self.task_log.log_step(
+            "warning",
+            "Main Agent | Localization Gate Result",
+            fallback_text[:800],
+        )
+        self._save_message_history(system_prompt, message_history)
+        return message_history
+
     async def _run_pre_summary_localization_gate(
         self,
         system_prompt: str,
@@ -835,26 +923,26 @@ class Orchestrator:
             )
             return message_history
 
-        min_remaining_seconds = float(
-            self.cfg.agent.main_agent.get(
-                "localization_gate_min_remaining_seconds", 5
-            )
+        gate_budget_decision = self._decide_localization_gate_mode(
+            task_deadline=task_deadline,
+            final_summary_reserve_seconds=final_summary_reserve_seconds,
         )
-        if task_deadline is not None:
-            total_remaining = task_deadline - time.time()
-            required_remaining = max(0.0, final_summary_reserve_seconds) + max(
-                0.0, min_remaining_seconds
+        gate_mode = gate_budget_decision.mode
+        self.task_log.log_step(
+            "info",
+            "Main Agent | Localization Gate Budget",
+            gate_budget_decision.reason,
+        )
+        if gate_mode == "skip":
+            return self._append_skip_localization_gate_result(
+                system_prompt=system_prompt,
+                message_history=message_history,
+                decision=decision,
+                notes=(
+                    "Gate was skipped before tool use because remaining time was below "
+                    "the degraded-gate threshold."
+                ),
             )
-            if total_remaining < required_remaining:
-                self.task_log.log_step(
-                    "warning",
-                    "Main Agent | Localization Gate",
-                    (
-                        "Skipping localization gate because remaining time is below "
-                        f"threshold ({total_remaining:.1f}s < {required_remaining:.1f}s)."
-                    ),
-                )
-                return message_history
 
         gate_tool_definitions = self._filter_localization_gate_tool_definitions(
             tool_definitions
@@ -865,7 +953,15 @@ class Orchestrator:
                 "Main Agent | Localization Gate",
                 "No allowed localization gate tools were available. Skipping gate.",
             )
-            return message_history
+            return self._append_skip_localization_gate_result(
+                system_prompt=system_prompt,
+                message_history=message_history,
+                decision=decision,
+                notes=(
+                    "Gate was skipped because no allowed localization tools were "
+                    "available."
+                ),
+            )
 
         gate_history = [message.copy() for message in message_history]
         gate_history.append(
@@ -876,13 +972,25 @@ class Orchestrator:
                     candidate_answer=decision.candidate_answer,
                     entity_type=decision.entity_type,
                     question_language=decision.question_language,
+                    mode=gate_mode,
                 ),
             }
         )
 
-        max_tool_calls = int(
-            self.cfg.agent.main_agent.get("localization_gate_max_tool_calls", 2) or 2
-        )
+        if gate_mode == "degraded":
+            max_tool_calls = int(
+                self.cfg.agent.main_agent.get(
+                    "localization_gate_degraded_max_tool_calls", 1
+                )
+                or 1
+            )
+        else:
+            max_tool_calls = int(
+                self.cfg.agent.main_agent.get(
+                    "localization_gate_max_tool_calls", 2
+                )
+                or 2
+            )
         gate_tool_calls_used = 0
 
         self.current_agent_id = await self.stream.start_agent(LOCALIZATION_GATE_AGENT_NAME)
@@ -890,7 +998,10 @@ class Orchestrator:
         self.task_log.log_step(
             "info",
             "Main Agent | Localization Gate",
-            f"Starting localization gate for candidate '{decision.candidate_answer}'.",
+            (
+                f"Starting {gate_mode} localization gate for candidate "
+                f"'{decision.candidate_answer}'."
+            ),
         )
 
         try:
@@ -932,17 +1043,39 @@ class Orchestrator:
                     break
 
                 if len(tool_calls) > 1:
-                    self.task_log.log_step(
-                        "warning",
-                        "Main Agent | Localization Gate",
-                        "Gate produced multiple tool calls in one step. Only allowed calls within budget will be executed.",
-                    )
+                    if gate_mode == "degraded":
+                        self.task_log.log_step(
+                            "warning",
+                            "Main Agent | Localization Gate",
+                            "Degraded gate truncated multiple tool calls to 1.",
+                        )
+                    else:
+                        self.task_log.log_step(
+                            "warning",
+                            "Main Agent | Localization Gate",
+                            "Gate produced multiple tool calls in one step. Only allowed calls within budget will be executed.",
+                        )
 
                 all_tool_results_content_with_id = []
                 stop_gate = False
                 for tool_call in tool_calls:
                     if gate_tool_calls_used >= max_tool_calls:
                         break
+
+                    if (
+                        gate_mode == "degraded"
+                        and tool_call["tool_name"] != "google_search"
+                    ):
+                        if tool_call["tool_name"] != "scrape_and_extract_info" or not self._has_recent_url_candidate(
+                            gate_history, str(tool_call["arguments"].get("url", ""))
+                        ):
+                            self.task_log.log_step(
+                                "warning",
+                                "Main Agent | Localization Gate",
+                                "Degraded gate only allows one direct google_search unless an exact recent URL candidate is present. Ending gate.",
+                            )
+                            stop_gate = True
+                            break
 
                     if gate_tool_calls_used == 0 and tool_call["tool_name"] != "google_search":
                         if tool_call["tool_name"] != "scrape_and_extract_info" or not self._has_recent_url_candidate(
@@ -986,6 +1119,7 @@ class Orchestrator:
                 task_description=task_description,
                 decision=decision,
                 turn_count=turn_count,
+                gate_mode=gate_mode,
             )
             if gate_result_text:
                 gate_history.append({"role": "assistant", "content": gate_result_text})
@@ -993,6 +1127,22 @@ class Orchestrator:
                     "info",
                     "Main Agent | Localization Gate Result",
                     gate_result_text[:800],
+                )
+                self._save_message_history(system_prompt, gate_history)
+            else:
+                fallback_text = self._build_fallback_localization_gate_result_text(
+                    decision=decision,
+                    gate_mode=gate_mode,
+                    notes=(
+                        "Gate result step failed to produce a structured result; "
+                        "using deterministic fallback."
+                    ),
+                )
+                gate_history.append({"role": "assistant", "content": fallback_text})
+                self.task_log.log_step(
+                    "warning",
+                    "Main Agent | Localization Gate Result",
+                    fallback_text[:800],
                 )
                 self._save_message_history(system_prompt, gate_history)
 

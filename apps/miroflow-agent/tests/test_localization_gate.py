@@ -1,4 +1,6 @@
 from src.utils.localization_gate_utils import (
+    decide_localization_gate_mode_from_remaining,
+    LocalizationGateBudgetDecision,
     LocalizationGateDecision,
     parse_localization_gate_decision,
     should_run_localization_gate,
@@ -76,3 +78,37 @@ def test_should_not_run_localization_gate_for_non_named_entity():
     )
 
     assert should_run_localization_gate(decision) is False
+
+
+def test_decide_localization_gate_mode_full():
+    budget_decision = decide_localization_gate_mode_from_remaining(
+        remaining_seconds=65.0,
+        final_summary_reserve_seconds=40.0,
+        full_min_remaining_seconds=20.0,
+        degraded_min_remaining_seconds=8.0,
+    )
+
+    assert isinstance(budget_decision, LocalizationGateBudgetDecision)
+    assert budget_decision.mode == "full"
+
+
+def test_decide_localization_gate_mode_degraded():
+    budget_decision = decide_localization_gate_mode_from_remaining(
+        remaining_seconds=50.0,
+        final_summary_reserve_seconds=40.0,
+        full_min_remaining_seconds=20.0,
+        degraded_min_remaining_seconds=8.0,
+    )
+
+    assert budget_decision.mode == "degraded"
+
+
+def test_decide_localization_gate_mode_skip():
+    budget_decision = decide_localization_gate_mode_from_remaining(
+        remaining_seconds=45.0,
+        final_summary_reserve_seconds=40.0,
+        full_min_remaining_seconds=20.0,
+        degraded_min_remaining_seconds=8.0,
+    )
+
+    assert budget_decision.mode == "skip"

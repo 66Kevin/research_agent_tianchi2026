@@ -15,10 +15,12 @@ def test_tianchi_benchmark_uses_30s_gate_and_30s_final_summary_reserves():
 
     assert cfg.execution.task_timeout_seconds == 600
     assert cfg.execution.localization_gate_reserve_seconds == 30
-    assert cfg.execution.final_summary_reserve_seconds == 30
+    assert cfg.execution.final_summary_reserve_seconds == 40
+    assert cfg.execution.localization_gate_full_min_remaining_seconds == 20
+    assert cfg.execution.localization_gate_degraded_min_remaining_seconds == 8
     assert (
         cfg.execution.task_timeout_seconds
         - cfg.execution.localization_gate_reserve_seconds
         - cfg.execution.final_summary_reserve_seconds
-        == 540
+        == 530
     )
