@@ -27,10 +27,18 @@ from ..llm.base_client import BaseClient
 from ..llm.errors import PolicyBlockedError
 from ..logging.task_logger import TaskLog, get_utc_plus_8_time
 from ..utils.parsing_utils import extract_llm_response_text
+from ..utils.localization_gate_utils import (
+    LocalizationGateDecision,
+    parse_localization_gate_decision,
+    should_run_localization_gate,
+)
 from ..utils.prompt_utils import (
     BLOCKED_BY_POLICY_MESSAGE,
     generate_agent_specific_system_prompt,
     generate_agent_summarize_prompt,
+    generate_localization_gate_decision_prompt,
+    generate_localization_gate_prompt,
+    generate_localization_gate_result_prompt,
     mcp_tags,
     refusal_keywords,
 )
@@ -57,6 +65,11 @@ EXTRA_ATTEMPTS_BUFFER = 200
 
 # Hard limit for budgeted web tool calls. Set to 0 to disable.
 DEFAULT_WEB_TOOL_CALL_HARD_LIMIT = 0
+LOCALIZATION_GATE_AGENT_NAME = "Pre-Summary Localization Gate"
+LOCALIZATION_GATE_ALLOWED_TOOLS = {
+    ("search_and_scrape_webpage", "google_search"),
+    ("jina_scrape_llm_summary", "scrape_and_extract_info"),
+}
 
 
 def _list_tools(sub_agent_tool_managers: Dict[str, ToolManager]):
@@ -215,6 +228,16 @@ class Orchestrator:
             pass
         try:
             await self.stream.end_agent("Final Summary", self.current_agent_id)
+        except Exception:
+            pass
+        try:
+            await self.stream.end_llm(LOCALIZATION_GATE_AGENT_NAME)
+        except Exception:
+            pass
+        try:
+            await self.stream.end_agent(
+                LOCALIZATION_GATE_AGENT_NAME, self.current_agent_id
+            )
         except Exception:
             pass
         try:
@@ -487,6 +510,505 @@ class Orchestrator:
             "scrape_website",
             "scrape_and_extract_info",
         }
+
+    @staticmethod
+    def _compute_task_deadlines(
+        task_start_time: float,
+        task_timeout_seconds: float,
+        localization_gate_reserve_seconds: float,
+        final_summary_reserve_seconds: float,
+    ) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+        """Compute task, main-loop, and gate deadlines from soft reserve settings."""
+        if task_timeout_seconds <= 0:
+            return None, None, None
+
+        task_deadline = task_start_time + task_timeout_seconds
+        main_loop_deadline = (
+            task_deadline
+            - max(0.0, localization_gate_reserve_seconds)
+            - max(0.0, final_summary_reserve_seconds)
+        )
+        gate_deadline = task_deadline - max(0.0, final_summary_reserve_seconds)
+        return task_deadline, main_loop_deadline, gate_deadline
+
+    @staticmethod
+    def _remaining_seconds(deadline: Optional[float]) -> Optional[float]:
+        if deadline is None:
+            return None
+        return deadline - time.time()
+
+    @staticmethod
+    def _filter_localization_gate_tool_definitions(
+        tool_definitions: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Keep only the tools allowed inside the pre-summary localization gate."""
+        filtered: List[Dict[str, Any]] = []
+        for server in tool_definitions:
+            server_name = server.get("name")
+            tools = []
+            for tool in server.get("tools", []) or []:
+                tool_name = tool.get("name")
+                if (server_name, tool_name) in LOCALIZATION_GATE_ALLOWED_TOOLS:
+                    tools.append(tool)
+            if tools:
+                filtered.append({"name": server_name, "tools": tools})
+        return filtered
+
+    @staticmethod
+    def _has_recent_url_candidate(message_history: List[Dict[str, Any]], url: str) -> bool:
+        """Allow direct scrape only when the exact URL appears in recent context."""
+        if not url:
+            return False
+        recent_messages = message_history[-6:]
+        for message in recent_messages:
+            content = message.get("content", "")
+            if isinstance(content, list):
+                content = " ".join(
+                    str(item.get("text", ""))
+                    for item in content
+                    if isinstance(item, dict)
+                )
+            if url in str(content):
+                return True
+        return False
+
+    @staticmethod
+    def _should_run_localization_gate(
+        decision: Optional[LocalizationGateDecision],
+    ) -> bool:
+        return should_run_localization_gate(decision)
+
+    async def _run_localization_gate_decision(
+        self,
+        system_prompt: str,
+        message_history: List[Dict[str, Any]],
+        task_description: str,
+        turn_count: int,
+    ) -> Optional[LocalizationGateDecision]:
+        """Run the JSON-only decision call that determines whether the gate is needed."""
+        decision_history = [message.copy() for message in message_history]
+        decision_history.append(
+            {
+                "role": "user",
+                "content": generate_localization_gate_decision_prompt(task_description),
+            }
+        )
+
+        (
+            decision_text,
+            _,
+            tool_calls,
+            _,
+        ) = await self.answer_generator.handle_llm_call(
+            system_prompt,
+            decision_history,
+            [],
+            turn_count + 1000,
+            "Main Agent | Localization Gate Decision",
+            agent_type="main",
+            temperature_override=resolve_temperature(self.cfg, "final_summary"),
+        )
+
+        if tool_calls:
+            self.task_log.log_step(
+                "warning",
+                "Main Agent | Localization Gate Decision",
+                "Decision step attempted tool use. Skipping localization gate.",
+            )
+            return None
+
+        decision = parse_localization_gate_decision(decision_text or "")
+        if decision is None:
+            self.task_log.log_step(
+                "warning",
+                "Main Agent | Localization Gate Decision",
+                "Failed to parse localization gate decision JSON. Skipping gate.",
+            )
+            return None
+
+        self.task_log.log_step(
+            "info",
+            "Main Agent | Localization Gate Decision",
+            (
+                f"candidate='{decision.candidate_answer}', entity_type={decision.entity_type}, "
+                f"question_language={decision.question_language}, "
+                f"candidate_language={decision.candidate_answer_language}, "
+                f"localized_name_status={decision.localized_name_status}, "
+                f"should_run_gate={decision.should_run_gate}"
+            ),
+        )
+        return decision
+
+    async def _execute_localization_gate_tool_call(
+        self,
+        tool_call: Dict[str, Any],
+        message_history: List[Dict[str, Any]],
+        tool_index: Dict[str, Set[str]],
+        tool_to_server_index: Dict[str, Set[str]],
+    ) -> Tuple[Optional[Tuple[str, Dict[str, Any]]], bool]:
+        """Execute one gate tool call with stricter routing and no rollback logic."""
+        server_name = tool_call["server_name"]
+        tool_name = tool_call["tool_name"]
+        arguments = self.tool_executor.fix_tool_call_arguments(
+            tool_name, tool_call["arguments"]
+        )
+        call_id = tool_call["id"]
+
+        repaired_server_name, repaired_tool_name, repair_reason = (
+            self._repair_tool_call_routing(
+                server_name=server_name,
+                tool_name=tool_name,
+                tool_index=tool_index,
+                tool_to_server_index=tool_to_server_index,
+            )
+        )
+        if repair_reason:
+            self.task_log.log_step(
+                "info",
+                "Main Agent | Localization Gate Routing Repaired",
+                (
+                    f"Auto-repaired routing ({repair_reason}): "
+                    f"{server_name}/{tool_name} -> {repaired_server_name}/{repaired_tool_name}"
+                ),
+            )
+            server_name = repaired_server_name
+            tool_name = repaired_tool_name
+
+        is_valid, validation_error = self._validate_tool_call(
+            server_name, tool_name, tool_index
+        )
+        if not is_valid:
+            self.task_log.log_step(
+                "warning",
+                "Main Agent | Localization Gate",
+                f"Invalid gate tool routing: {validation_error}. Ending gate.",
+            )
+            return None, True
+
+        if (server_name, tool_name) not in LOCALIZATION_GATE_ALLOWED_TOOLS:
+            self.task_log.log_step(
+                "warning",
+                "Main Agent | Localization Gate",
+                f"Disallowed gate tool requested: {server_name}/{tool_name}. Ending gate.",
+            )
+            return None, True
+
+        if (
+            tool_name == "scrape_and_extract_info"
+            and not self._has_recent_url_candidate(
+                message_history, str(arguments.get("url", ""))
+            )
+        ):
+            self.task_log.log_step(
+                "warning",
+                "Main Agent | Localization Gate",
+                "First scrape call lacked a recent URL candidate in context. Ending gate.",
+            )
+            return None, True
+
+        call_start_time = time.time()
+        tool_call_id = await self.stream.tool_call(tool_name, arguments)
+        try:
+            tool_result = await self.main_agent_tool_manager.execute_tool_call(
+                server_name=server_name,
+                tool_name=tool_name,
+                arguments=arguments,
+            )
+            tool_result = self.tool_executor.post_process_tool_call_result(
+                tool_name, tool_result
+            )
+            result = tool_result.get("result") or tool_result.get("error")
+            await self.stream.tool_call(
+                tool_name, {"result": result}, tool_call_id=tool_call_id
+            )
+        except PolicyBlockedError:
+            raise
+        except Exception as e:
+            tool_result = {
+                "server_name": server_name,
+                "tool_name": tool_name,
+                "error": str(e),
+            }
+            self.task_log.log_step(
+                "warning",
+                "Main Agent | Localization Gate",
+                f"Gate tool {tool_name} failed: {str(e)}",
+            )
+
+        call_duration_ms = int((time.time() - call_start_time) * 1000)
+        self.task_log.log_step(
+            "info",
+            "Main Agent | Localization Gate Tool Call",
+            f"Tool {tool_name} completed in {call_duration_ms}ms",
+        )
+
+        tool_result_for_llm = self.output_formatter.format_tool_result_for_user(tool_result)
+        return (call_id, tool_result_for_llm), False
+
+    async def _run_localization_gate_result_step(
+        self,
+        system_prompt: str,
+        message_history: List[Dict[str, Any]],
+        task_description: str,
+        decision: LocalizationGateDecision,
+        turn_count: int,
+    ) -> Optional[str]:
+        """Generate the authoritative localization gate result block."""
+        result_history = [message.copy() for message in message_history]
+        result_history.append(
+            {
+                "role": "user",
+                "content": generate_localization_gate_result_prompt(
+                    task_description,
+                    decision.candidate_answer,
+                    decision.entity_type,
+                ),
+            }
+        )
+
+        (
+            result_text,
+            _,
+            tool_calls,
+            _,
+        ) = await self.answer_generator.handle_llm_call(
+            system_prompt,
+            result_history,
+            [],
+            turn_count + 3000,
+            "Main Agent | Localization Gate Result",
+            agent_type="main",
+            temperature_override=resolve_temperature(self.cfg, "final_summary"),
+        )
+
+        if tool_calls:
+            self.task_log.log_step(
+                "warning",
+                "Main Agent | Localization Gate Result",
+                "Result step attempted tool use. Skipping localization result block.",
+            )
+            return None
+
+        cleaned_text = (result_text or "").strip()
+        if not cleaned_text:
+            self.task_log.log_step(
+                "warning",
+                "Main Agent | Localization Gate Result",
+                "Localization gate result step returned empty output.",
+            )
+            return None
+
+        return cleaned_text
+
+    async def _run_pre_summary_localization_gate(
+        self,
+        system_prompt: str,
+        message_history: List[Dict[str, Any]],
+        tool_definitions: List[Dict[str, Any]],
+        task_description: str,
+        turn_count: int,
+        tool_index: Dict[str, Set[str]],
+        tool_to_server_index: Dict[str, Set[str]],
+        active_main_temperature: float,
+        task_deadline: Optional[float],
+        gate_deadline: Optional[float],
+        final_summary_reserve_seconds: float,
+    ) -> List[Dict[str, Any]]:
+        """Run the bounded pre-summary localization gate when needed."""
+        if not bool(
+            self.cfg.agent.main_agent.get("localization_gate_enabled", False)
+        ):
+            return message_history
+
+        decision = await self._run_localization_gate_decision(
+            system_prompt=system_prompt,
+            message_history=message_history,
+            task_description=task_description,
+            turn_count=turn_count,
+        )
+
+        if not self._should_run_localization_gate(decision):
+            self.task_log.log_step(
+                "info",
+                "Main Agent | Localization Gate",
+                "Skipping localization gate: trigger conditions not met.",
+            )
+            return message_history
+
+        min_remaining_seconds = float(
+            self.cfg.agent.main_agent.get(
+                "localization_gate_min_remaining_seconds", 5
+            )
+        )
+        if task_deadline is not None:
+            total_remaining = task_deadline - time.time()
+            required_remaining = max(0.0, final_summary_reserve_seconds) + max(
+                0.0, min_remaining_seconds
+            )
+            if total_remaining < required_remaining:
+                self.task_log.log_step(
+                    "warning",
+                    "Main Agent | Localization Gate",
+                    (
+                        "Skipping localization gate because remaining time is below "
+                        f"threshold ({total_remaining:.1f}s < {required_remaining:.1f}s)."
+                    ),
+                )
+                return message_history
+
+        gate_tool_definitions = self._filter_localization_gate_tool_definitions(
+            tool_definitions
+        )
+        if not gate_tool_definitions:
+            self.task_log.log_step(
+                "warning",
+                "Main Agent | Localization Gate",
+                "No allowed localization gate tools were available. Skipping gate.",
+            )
+            return message_history
+
+        gate_history = [message.copy() for message in message_history]
+        gate_history.append(
+            {
+                "role": "user",
+                "content": generate_localization_gate_prompt(
+                    task_description=task_description,
+                    candidate_answer=decision.candidate_answer,
+                    entity_type=decision.entity_type,
+                    question_language=decision.question_language,
+                ),
+            }
+        )
+
+        max_tool_calls = int(
+            self.cfg.agent.main_agent.get("localization_gate_max_tool_calls", 2) or 2
+        )
+        gate_tool_calls_used = 0
+
+        self.current_agent_id = await self.stream.start_agent(LOCALIZATION_GATE_AGENT_NAME)
+        await self.stream.start_llm(LOCALIZATION_GATE_AGENT_NAME)
+        self.task_log.log_step(
+            "info",
+            "Main Agent | Localization Gate",
+            f"Starting localization gate for candidate '{decision.candidate_answer}'.",
+        )
+
+        try:
+            while gate_tool_calls_used < max_tool_calls:
+                if gate_deadline is not None and time.time() >= gate_deadline:
+                    self.task_log.log_step(
+                        "warning",
+                        "Main Agent | Localization Gate",
+                        "Gate deadline reached. Ending localization gate.",
+                    )
+                    break
+
+                (
+                    assistant_response_text,
+                    _,
+                    tool_calls,
+                    gate_history,
+                ) = await self.answer_generator.handle_llm_call(
+                    system_prompt,
+                    gate_history,
+                    gate_tool_definitions,
+                    turn_count + 2000 + gate_tool_calls_used,
+                    f"Main Agent | Localization Gate (step {gate_tool_calls_used + 1})",
+                    agent_type="main",
+                    temperature_override=active_main_temperature,
+                )
+
+                if assistant_response_text:
+                    text_response = extract_llm_response_text(assistant_response_text)
+                    if text_response:
+                        await self.stream.tool_call("show_text", {"text": text_response})
+
+                if not tool_calls:
+                    self.task_log.log_step(
+                        "info",
+                        "Main Agent | Localization Gate",
+                        "Localization gate ended without additional tool calls.",
+                    )
+                    break
+
+                if len(tool_calls) > 1:
+                    self.task_log.log_step(
+                        "warning",
+                        "Main Agent | Localization Gate",
+                        "Gate produced multiple tool calls in one step. Only allowed calls within budget will be executed.",
+                    )
+
+                all_tool_results_content_with_id = []
+                stop_gate = False
+                for tool_call in tool_calls:
+                    if gate_tool_calls_used >= max_tool_calls:
+                        break
+
+                    if gate_tool_calls_used == 0 and tool_call["tool_name"] != "google_search":
+                        if tool_call["tool_name"] != "scrape_and_extract_info" or not self._has_recent_url_candidate(
+                            gate_history, str(tool_call["arguments"].get("url", ""))
+                        ):
+                            self.task_log.log_step(
+                                "warning",
+                                "Main Agent | Localization Gate",
+                                "First gate call must be google_search unless an exact recent URL candidate is present. Ending gate.",
+                            )
+                            stop_gate = True
+                            break
+
+                    formatted_result, should_stop = (
+                        await self._execute_localization_gate_tool_call(
+                            tool_call=tool_call,
+                            message_history=gate_history,
+                            tool_index=tool_index,
+                            tool_to_server_index=tool_to_server_index,
+                        )
+                    )
+                    if formatted_result is not None:
+                        all_tool_results_content_with_id.append(formatted_result)
+                        gate_tool_calls_used += 1
+                    if should_stop:
+                        stop_gate = True
+                        break
+
+                if all_tool_results_content_with_id:
+                    gate_history = self.llm_client.update_message_history(
+                        gate_history, all_tool_results_content_with_id
+                    )
+                    self._save_message_history(system_prompt, gate_history)
+
+                if stop_gate:
+                    break
+
+            gate_result_text = await self._run_localization_gate_result_step(
+                system_prompt=system_prompt,
+                message_history=gate_history,
+                task_description=task_description,
+                decision=decision,
+                turn_count=turn_count,
+            )
+            if gate_result_text:
+                gate_history.append({"role": "assistant", "content": gate_result_text})
+                self.task_log.log_step(
+                    "info",
+                    "Main Agent | Localization Gate Result",
+                    gate_result_text[:800],
+                )
+                self._save_message_history(system_prompt, gate_history)
+
+            return gate_history
+        finally:
+            try:
+                await self.stream.end_llm(LOCALIZATION_GATE_AGENT_NAME)
+            except Exception:
+                pass
+            try:
+                await self.stream.end_agent(
+                    LOCALIZATION_GATE_AGENT_NAME, self.current_agent_id
+                )
+            except Exception:
+                pass
+            self.current_agent_id = None
 
     async def run_sub_agent(
         self,
@@ -1068,18 +1590,26 @@ class Orchestrator:
         consecutive_rollbacks = 0
         web_tool_calls = 0
         active_main_temperature = resolve_temperature(self.cfg, "main_agent")
+        task_start_time = time.time()
         task_timeout_seconds = float(
             self.cfg.benchmark.execution.get("task_timeout_seconds", 0)
         )
-        final_summary_reserve_seconds = float(
-            self.cfg.benchmark.execution.get("final_summary_reserve_seconds", 90)
+        localization_gate_reserve_seconds = float(
+            self.cfg.benchmark.execution.get("localization_gate_reserve_seconds", 30)
         )
-        main_loop_deadline = None
-        if task_timeout_seconds > 0:
-            loop_budget = max(
-                1.0, task_timeout_seconds - max(0.0, final_summary_reserve_seconds)
-            )
-            main_loop_deadline = time.time() + loop_budget
+        final_summary_reserve_seconds = float(
+            self.cfg.benchmark.execution.get("final_summary_reserve_seconds", 30)
+        )
+        (
+            task_deadline,
+            main_loop_deadline,
+            gate_deadline,
+        ) = self._compute_task_deadlines(
+            task_start_time=task_start_time,
+            task_timeout_seconds=task_timeout_seconds,
+            localization_gate_reserve_seconds=localization_gate_reserve_seconds,
+            final_summary_reserve_seconds=final_summary_reserve_seconds,
+        )
 
         self.current_agent_id = await self.stream.start_agent("main")
         await self.stream.start_llm("main")
@@ -1514,6 +2044,27 @@ class Orchestrator:
                 "info",
                 "Main Agent | Main Loop Completed",
                 f"Main loop completed after {turn_count} turns",
+            )
+
+        try:
+            message_history = await self._run_pre_summary_localization_gate(
+                system_prompt=system_prompt,
+                message_history=message_history,
+                tool_definitions=tool_definitions,
+                task_description=task_description,
+                turn_count=turn_count,
+                tool_index=tool_index,
+                tool_to_server_index=tool_to_server_index,
+                active_main_temperature=active_main_temperature,
+                task_deadline=task_deadline,
+                gate_deadline=gate_deadline,
+                final_summary_reserve_seconds=final_summary_reserve_seconds,
+            )
+        except PolicyBlockedError as e:
+            return await self._handle_policy_blocked(
+                task_id=task_id,
+                workflow_id=workflow_id,
+                blocked_reason=str(e),
             )
 
         # Final summary

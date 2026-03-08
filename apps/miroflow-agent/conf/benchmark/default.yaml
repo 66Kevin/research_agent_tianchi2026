@@ -15,4 +15,5 @@ execution:
   max_concurrent: 5 
   pass_at_k: 1
   task_timeout_seconds: 600
-  final_summary_reserve_seconds: 90
+  localization_gate_reserve_seconds: 30
+  final_summary_reserve_seconds: 40

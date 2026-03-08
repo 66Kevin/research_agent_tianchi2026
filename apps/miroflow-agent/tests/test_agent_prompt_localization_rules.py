@@ -18,3 +18,14 @@ def test_tianchi_agent_prompt_contains_localization_rules():
     assert "Wikipedia or other major reference encyclopedias" in prompt
     assert "at most 3 high-information-gain queries" in prompt
     assert "at most 2 scrape calls" in prompt
+    assert "best_effort" in prompt
+    assert "For person answers" in prompt
+    assert "Usually prefer first name + last name" in prompt
+    assert "Do not automatically include middle names" in prompt
+    assert "best-effort localized form" in prompt
+    assert (
+        "When a dedicated localization-verification round is invoked before final answer generation"
+        in prompt
+    )
+    assert "If search budget is nearly exhausted" not in prompt
+    assert "must happen near the end of the search process" not in prompt
