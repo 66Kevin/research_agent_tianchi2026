@@ -1,47 +1,257 @@
-# Deep Research Agent for Tianchi2026 Challenge
+# Tianchi 2026 AI Research Agent Solution
 
-## Tricks
-### Done
-**Prompt优化：**
-- WIP...
-- 
-  
-**Context/Memory优化：**
-- 上下文隔离：当主Agent遇到复杂问题时，希望不要自己在当前的上下文里死磕，而是新开一个sub_agent。
-- 主动监控上下文状态：每一轮结束后主动检查剩余context，防止上下文爆炸。
-- Rollback机制：Agent在运行过程中出错（如工具调用格式错误、幻觉、网络超时）信息自动回退，保证上下文干净。
-- 重复查询过滤：防止 Agent 陷入死循环（反复搜索同一个词），引入记忆去重机制，避免了无效的重复信息占用上下文。
-- 智能压缩：保留推理链条但丢弃过时数据。
+本仓库是我们在 2026 天池 AI Research Agent 比赛中的解决方案实现，目标是构建一个面向复杂开放域检索问答任务的 Deep Research Agent。整体方案基于 `MiroThinker` / `MiroFlow` 的 Agent 框架思路继续迭代，并针对天池赛题的多跳检索、证据验证、跨语言实体规范化、长上下文稳定性和时限约束做了专项优化。
 
-**其他优化：**
-- WIP...
-- 
-### TODO
-- 后处理：json-repair防止输出为非json结构，LLM最后的输出检查
-- 时间限制优化：限制10min内，时间优化（越短越好）
-- Ensemble策略：运行多次进行ensemble，但是要考虑时间问题！！
-- tool calling优化：什么时候用google，什么时候用国内搜索api，fallback机制/策略
+## 致谢与参考
 
+本方案明确参考了 `MiroThinker` 的设计与工程实现
 
-## Experiments
+## 整体方案
 
-| # | Model         | Tool(s)                     | Score  | Improvement | Comment |
-|---|---------------|-----------------------------|--------|-------------|---------|
-| 1 | deepseek-chat | google-search, jina scrape  | 0.6162 | -           |         |
-| 2 | qwen3-max     | None                        | 0.2929 | -           |         |
-| 3 | qwen3-max     | google-search               | 0.3535 | -           |         |
-| 4 | qwen3-max     | google-search (search-only) | 0.5051 | search-only tool policy (blacklist sogou_search); MCP tool-call parsing hardening (`_normalize_mcp_name` + malformed `<use_mcp_tool>` fallback); qwen `enable_thinking` + reasoning log | local run, 97/100 completed (last 3 manually stopped) |
-| 5 | qwen3.5-plus  | google-search (Serper only) | 0.5152 | stage-1 efficiency prompt skill; tool routing auto-repair; web tool hard-limit; data-inspection rollback/minimal-context retry; timeout/final-summary reserve | full run, 100/100 completed |
-| 6 | qwen3.5-plus  | google-search, jina scrape  | 0.5758 | enhance jina scrape usage by prompts | full run, 100/100 completed |
+整体流程如下：
 
-Log Path：
-1. logs/gaia-validation/deepseek_deepseek-chat_mirothinker_v1.5_keep5_max200/run_20260206_110146
-2. logs/tianchi-validation/qwen_qwen3-max_mirothinker_v1.5_keep5_max200
-3. logs/tianchi-validation/qwen_qwen3-max_mirothinker_v1.5_keep5_max200_tianchi
-4. apps/miroflow-agent/logs/tianchi-validation/qwen_qwen3-max_mirothinker_v1.5_search_only_keep5_max200/fg_full_probe_20260216_154936
-5. logs/tianchi-validation/qwen_qwen3.5-plus_mirothinker_v1.5_keep5_max200/v5_serper_newkey_full_20260219_082009
-6. logs/tianchi-validation/qwen_qwen3.5-plus_mirothinker_v1.5_keep5_max200_tianchi/run_20260220_104009_score0.57
+```text
+问题理解
+  -> 拆解缺失证据
+  -> 搜索候选来源
+  -> 页面级抓取与抽取
+  -> 多轮验证与候选排除
+  -> 本地化/标准译名检查
+  -> 最终短答案生成
+```
 
-Run Note:
-- local run completed 97 tasks before manual stop
-- average runtime from task_runtimes.jsonl: 00:17:44
+系统实现上主要由两部分组成：
+
+- `apps/miroflow-agent`：Agent 主体，包括 Orchestrator、推理流程、配置系统、日志与批量推理脚本。
+- `libs/miroflow-tools`：工具层，封装搜索、网页抓取、摘要抽取等 MCP 工具。
+
+在天池配置 `mirothinker_v1.5_keep5_max200_tianchi` 中，主 Agent 主要使用两类工具：
+
+- `search_and_scrape_webpage/google_search`：发现候选来源、建立竞争假设、定位后续应访问的页面。
+- `jina_scrape_llm_summary/scrape_and_extract_info`：对网页或 PDF 做定向抽取，而不是泛化摘要。
+
+## 核心优化
+
+### 1. 分层上下文隔离
+
+这是 Orchestrator 最关键的内存管理机制。系统采用主智能体和子智能体分层执行：
+
+- 当主 Agent 遇到复杂子问题时，不在当前 `message_history` 中硬撑，而是调用 `run_sub_agent` 开启子任务。
+- 子 Agent 拥有一份全新的独立上下文，只携带子任务描述，不继承主 Agent 的冗余历史。
+- 子 Agent 可能执行几十轮搜索、抓取和推理，但返回给主 Agent 的只有最终结果，而不是完整过程日志。
+
+这样做的本质是把“大量中间推理 token”压缩成“一个高价值结论”，从而显著降低主上下文膨胀速度。对于长链路、多页面、多候选实体的问题，这个机制非常重要。
+
+### 2. 主动上下文监控与熔断
+
+我们没有被动等待模型因上下文溢出而失败，而是在每轮结束后主动检查剩余预算：
+
+- 结合模型 `max_context_length` 做上下文空间估计。
+- 在接近预算上限时触发压缩或提前进入收束阶段。
+- 为最终总结和本地化校验预留独立时间窗口，避免“前面搜索太久，最后来不及输出”。
+
+这套机制的目标是把失败前移为可控退化，让 Agent 在有限时间和上下文预算内优先保证“有证据的可交付答案”。
+
+### 3. 基于回滚的脏数据清洗
+
+Agent 执行过程中不可避免会出现工具调用格式错误、模型幻觉、页面抽取失败或超时等问题。如果把这些错误轨迹长期保留在上下文中，会同时造成两个问题：浪费 token，以及诱导模型重复犯同类错误。
+
+因此我们在 Orchestrator 中引入了基于 rollback 的清洗策略：
+
+- 当某一轮输出明显异常时，当前轮次不进入稳定记忆。
+- 通过 `consecutive_rollbacks` 记录连续回滚次数，避免无限重试。
+- 在大多数情况下，模型看不到自己刚刚产生的脏轨迹，只保留恢复后的有效上下文。
+
+这相当于把错误尝试视为“事务失败”，默认不提交到长期记忆，从而保持上下文尽可能干净。
+
+### 4. 重复查询过滤
+
+Research Agent 很容易在复杂问题上陷入搜索死循环，例如反复搜索同一组关键词、只做轻微改写、或者围绕错误候选不断打转。
+
+为此系统加入了查询去重与重复检测：
+
+- 使用 `used_queries` 记录已经调用过的查询及其参数。
+- 对重复或近重复搜索做拦截，迫使 Agent 改变检索角度。
+- 配合 prompt 中的“每轮必须重写 query list”规则，避免追加式、惯性式搜索。
+
+这个机制直接减少了无效调用，也让有限的工具预算更多用于真正能带来新证据的搜索路径。
+
+### 5. 基于近因的工具结果压缩
+
+长网页抓取结果是上下文膨胀的主要来源。我们的做法不是粗暴截断整个历史，而是优先保留“推理链条”，压缩“过时原始观察”：
+
+- 通过 `keep_tool_result` 控制保留最近多少条工具结果，当前常用设置为 `5`。
+- 在构造发送给 LLM 的消息时，保留思考与动作轨迹。
+- 对更早的工具返回内容，用类似 `Tool result is omitted to save tokens.` 的占位文本替换。
+
+背后的假设是：如果较早的页面信息确实重要，它应该已经被模型吸收并体现在后续 thought 中；因此没有必要无限保留原始长文本。
+
+### 6. 天池场景下的额外适配
+
+除以上通用机制外，我们还针对天池赛题做了几项定制：
+
+- 强化 evidence-first prompt，要求先明确答案类型、语言和最小证据集，再发起搜索。
+- 限制每轮搜索 query 数量，并强制从不同角度重写，减少无效枚举。
+- 加入 localization gate，在最终总结前专门检查人名、机构名、标题等实体的中文/英文标准形式。
+- 增加 web tool hard limit、超时预留和最终总结保底逻辑，提升整体完赛率。
+
+## 为什么这些优化有效
+
+可以把 Orchestrator 的内存治理理解为一套组合拳，而不是单点 trick：
+
+- 物理隔离：通过子 Agent 承担高成本子任务。
+- 动态修剪：通过 rollback 清洗错误轨迹。
+- 近因保留：保留最近有效观察，压缩早期长文本。
+- 重复抑制：防止搜索行为陷入循环。
+- 安全底线：通过上下文和时间预算检查避免任务在最后阶段崩溃。
+
+## 仓库结构
+
+```text
+.
+├── apps/miroflow-agent
+│   ├── conf/                  # LLM、Agent、Benchmark 配置
+│   ├── src/                   # Agent 核心实现
+│   ├── jsonl_inference/       # 批量推理与结果回填
+│   ├── scripts/               # 天池验证集运行脚本
+│   └── tests/                 # 单测
+├── libs/miroflow-tools        # 搜索、抓取等工具层
+├── logs/                      # 实验日志与推理结果
+└── README.md
+```
+
+几个关键文件：
+
+- `apps/miroflow-agent/src/core/orchestrator.py`：主/子 Agent 协调、回滚、上下文管理、localization gate。
+- `apps/miroflow-agent/conf/agent/mirothinker_v1.5_keep5_max200_tianchi.yaml`：当前天池主配置。
+- `apps/miroflow-agent/scripts/run_jsonl_inference_tianchi-validation.sh`：批量推理入口脚本。
+
+## 环境安装
+
+建议使用 `uv` 和 Python `3.12+`。
+
+```bash
+cd apps/miroflow-agent
+uv sync
+```
+
+常用环境变量按实际 provider 配置，例如：
+
+```bash
+export API_KEY=YOUR_LLM_API_KEY
+export BASE_URL=YOUR_LLM_BASE_URL
+export SERPER_API_KEY=YOUR_SERPER_KEY
+export JINA_API_KEY=YOUR_JINA_KEY
+```
+
+如果使用脚本中的默认参数，也可以额外指定：
+
+```bash
+export LLM_CONFIG=qwen-3
+export LLM_PROVIDER=qwen
+export LLM_MODEL=qwen3.5-plus
+export AGENT_SET=mirothinker_v1.5_keep5_max200_tianchi
+```
+
+## 数据与配置
+
+默认天池验证配置位于：
+
+- `apps/miroflow-agent/conf/benchmark/tianchi-validation.yaml`
+- `apps/miroflow-agent/conf/agent/mirothinker_v1.5_keep5_max200_tianchi.yaml`
+
+默认输入数据路径为：
+
+```text
+data/tianchi/standardized_data.jsonl
+```
+
+天池配置中的一些关键设置：
+
+- `max_turns: 200`
+- `web_tool_call_hard_limit: 100`
+- `keep_tool_result: 5`
+- `context_compress_limit: 5`
+- `localization_gate_enabled: true`
+
+## 运行方式
+
+### 运行天池验证集
+
+```bash
+cd apps/miroflow-agent
+bash scripts/run_jsonl_inference_tianchi-validation.sh
+```
+
+### 常见自定义参数
+
+```bash
+cd apps/miroflow-agent
+INPUT_JSONL=../../data/tianchi/standardized_data.jsonl \
+LLM_CONFIG=qwen-3 \
+LLM_PROVIDER=qwen \
+LLM_MODEL=qwen3.5-plus \
+BASE_URL=YOUR_BASE_URL \
+API_KEY=YOUR_API_KEY \
+AGENT_SET=mirothinker_v1.5_keep5_max200_tianchi \
+MAX_CONTEXT_LENGTH=262144 \
+MAX_CONCURRENT=10 \
+bash scripts/run_jsonl_inference_tianchi-validation.sh
+```
+
+结果默认输出到：
+
+```text
+logs/tianchi-validation/<provider>_<model>_<agent_set>/<run_id>/
+```
+
+其中通常包含：
+
+- `final_answers.jsonl`
+- `benchmark_results.jsonl`
+- `task_runtimes.jsonl`
+- `summary_time_cost.json`
+- 每题对应的 `task_*.json` 日志
+
+## 实验结果
+
+| # | Model | Tool(s) | Score | Improvement | Comment |
+|---|---|---|---:|---|---|
+| 1 | deepseek-chat | google-search, jina scrape | 0.6162 | baseline from previous validation setting | |
+| 2 | qwen3-max | none | 0.2929 | no external tools | |
+| 3 | qwen3-max | google-search | 0.3535 | basic search integration | |
+| 4 | qwen3-max | google-search (search-only) | 0.5051 | search-only tool policy, MCP tool-call parsing hardening, qwen thinking log | local run, 97/100 completed |
+| 5 | qwen3.5-plus | google-search (Serper only) | 0.5152 | stage-1 efficiency prompt, tool routing auto-repair, web tool hard-limit, rollback/minimal-context retry, timeout/final-summary reserve | full run, 100/100 completed |
+| 6 | qwen3.5-plus | google-search, jina scrape | 0.5758 | stronger page-level extraction and evidence verification | full run, 100/100 completed |
+
+对应日志目录：
+
+1. `logs/gaia-validation/deepseek_deepseek-chat_mirothinker_v1.5_keep5_max200/run_20260206_110146`
+2. `logs/tianchi-validation/qwen_qwen3-max_mirothinker_v1.5_keep5_max200`
+3. `logs/tianchi-validation/qwen_qwen3-max_mirothinker_v1.5_keep5_max200_tianchi`
+4. `apps/miroflow-agent/logs/tianchi-validation/qwen_qwen3-max_mirothinker_v1.5_search_only_keep5_max200/fg_full_probe_20260216_154936`
+5. `logs/tianchi-validation/qwen_qwen3.5-plus_mirothinker_v1.5_keep5_max200/v5_serper_newkey_full_20260219_082009`
+6. `logs/tianchi-validation/qwen_qwen3.5-plus_mirothinker_v1.5_keep5_max200_tianchi/run_20260220_104009_score0.57`
+
+## 当前主推配置
+
+如果你想直接复现当前仓库的主线方案，建议优先使用：
+
+- Model: `qwen3.5-plus`
+- Agent config: `mirothinker_v1.5_keep5_max200_tianchi`
+- Tools: `google_search + jina scrape`
+
+这套配置相对平衡了：
+
+- 页面级证据获取能力
+- 长任务的上下文稳定性
+- 中文实体规范化表现
+- 完赛率与平均耗时
+
+## 已知问题与后续计划
+
+- 增加最终答案后处理，如 `json-repair` 与结构检查，进一步降低格式错误率。
+- 继续压缩平均推理时长，目标是在更严格时间限制下保持稳定表现。
+- 研究多次运行后的 ensemble / rerank 策略，但需要控制成本和时延。
+- 继续优化工具路由，包括不同搜索源之间的回退策略与质量判断。
+- 进一步加强答案规范化，尤其是人名、机构名、书名和历史实体的标准译名处理。
