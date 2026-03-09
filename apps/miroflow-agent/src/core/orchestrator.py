@@ -665,6 +665,7 @@ class Orchestrator:
             (
                 f"candidate='{decision.candidate_answer}', entity_type={decision.entity_type}, "
                 f"question_language={decision.question_language}, "
+                f"target_answer_language={decision.target_answer_language}, "
                 f"candidate_language={decision.candidate_answer_language}, "
                 f"localized_name_status={decision.localized_name_status}, "
                 f"should_run_gate={decision.should_run_gate}"
@@ -796,6 +797,7 @@ class Orchestrator:
                     task_description,
                     decision.candidate_answer,
                     decision.entity_type,
+                    decision.target_answer_language,
                     gate_mode=gate_mode,
                 ),
             }
@@ -843,6 +845,9 @@ class Orchestrator:
     ) -> str:
         """Construct a deterministic fallback localization gate result block."""
         normalized_question_language = decision.question_language or "unknown"
+        normalized_target_answer_language = (
+            decision.target_answer_language or normalized_question_language
+        )
         original_name_requested = "yes" if decision.original_name_requested else "no"
         verified_original_full_name = decision.candidate_answer or ""
         source_quality = "weak" if gate_mode == "skip" else "mixed"
@@ -857,9 +862,10 @@ class Orchestrator:
             f"- candidate_answer: {decision.candidate_answer}\n"
             f"- entity_type: {decision.entity_type}\n"
             f"- question_language: {normalized_question_language}\n"
+            f"- target_answer_language: {normalized_target_answer_language}\n"
             f"- original_name_requested: {original_name_requested}\n"
             "- localized_name_status: NOT_FOUND\n"
-            "- localized_form_in_question_language: \n"
+            "- localized_form_in_target_language: \n"
             f"- verified_original_full_name: {verified_original_full_name}\n"
             f"- source_basis: {source_basis}\n"
             f"- source_quality: {source_quality}\n"
@@ -972,6 +978,7 @@ class Orchestrator:
                     candidate_answer=decision.candidate_answer,
                     entity_type=decision.entity_type,
                     question_language=decision.question_language,
+                    target_answer_language=decision.target_answer_language,
                     mode=gate_mode,
                 ),
             }

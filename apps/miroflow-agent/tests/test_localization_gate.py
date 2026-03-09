@@ -14,6 +14,7 @@ def test_parse_localization_gate_decision_accepts_valid_json():
       "candidate_answer": "Arnoldo Mondadori Editore",
       "entity_type": "publisher",
       "question_language": "zh",
+      "target_answer_language": "zh",
       "candidate_answer_language": "en",
       "original_name_requested": false,
       "localized_name_status": "unresolved",
@@ -27,8 +28,29 @@ def test_parse_localization_gate_decision_accepts_valid_json():
     assert decision.candidate_answer == "Arnoldo Mondadori Editore"
     assert decision.entity_type == "publisher"
     assert decision.question_language == "zh"
+    assert decision.target_answer_language == "zh"
     assert decision.candidate_answer_language == "en"
     assert decision.localized_name_status == "unresolved"
+
+
+def test_parse_localization_gate_decision_falls_back_target_language_to_question_language():
+    raw_text = """
+    {
+      "should_run_gate": true,
+      "candidate_answer": "Arnoldo Mondadori Editore",
+      "entity_type": "publisher",
+      "question_language": "zh",
+      "candidate_answer_language": "en",
+      "original_name_requested": false,
+      "localized_name_status": "unresolved",
+      "reason": "Cross-language publisher answer is still unresolved."
+    }
+    """
+
+    decision = parse_localization_gate_decision(raw_text)
+
+    assert decision is not None
+    assert decision.target_answer_language == "zh"
 
 
 def test_parse_localization_gate_decision_returns_none_for_invalid_json():
@@ -41,6 +63,7 @@ def test_should_run_localization_gate_for_cross_language_named_entity():
         candidate_answer="Arnoldo Mondadori Editore",
         entity_type="publisher",
         question_language="zh",
+        target_answer_language="zh",
         candidate_answer_language="en",
         original_name_requested=False,
         localized_name_status="unresolved",
@@ -56,6 +79,7 @@ def test_should_not_run_localization_gate_for_original_name_request():
         candidate_answer="Alexandre Exquemelin",
         entity_type="person",
         question_language="zh",
+        target_answer_language="zh",
         candidate_answer_language="en",
         original_name_requested=True,
         localized_name_status="unresolved",
@@ -71,6 +95,7 @@ def test_should_not_run_localization_gate_for_non_named_entity():
         candidate_answer="42",
         entity_type="non_named_entity",
         question_language="zh",
+        target_answer_language="zh",
         candidate_answer_language="en",
         original_name_requested=False,
         localized_name_status="unresolved",
@@ -78,6 +103,38 @@ def test_should_not_run_localization_gate_for_non_named_entity():
     )
 
     assert should_run_localization_gate(decision) is False
+
+
+def test_should_not_run_localization_gate_when_target_language_matches_candidate_language():
+    decision = LocalizationGateDecision(
+        should_run_gate=True,
+        candidate_answer="Arnoldo Mondadori Editore",
+        entity_type="publisher",
+        question_language="zh",
+        target_answer_language="en",
+        candidate_answer_language="en",
+        original_name_requested=False,
+        localized_name_status="unresolved",
+        reason="Explicit English answer requested.",
+    )
+
+    assert should_run_localization_gate(decision) is False
+
+
+def test_should_run_localization_gate_when_explicit_target_language_differs_from_question_language():
+    decision = LocalizationGateDecision(
+        should_run_gate=True,
+        candidate_answer="Arnoldo Mondadori Editore",
+        entity_type="publisher",
+        question_language="en",
+        target_answer_language="zh",
+        candidate_answer_language="en",
+        original_name_requested=False,
+        localized_name_status="unresolved",
+        reason="Question is English but explicitly requests a Chinese answer.",
+    )
+
+    assert should_run_localization_gate(decision) is True
 
 
 def test_decide_localization_gate_mode_full():

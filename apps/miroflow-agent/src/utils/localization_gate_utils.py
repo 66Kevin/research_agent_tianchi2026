@@ -41,6 +41,7 @@ class LocalizationGateDecision:
     candidate_answer: str
     entity_type: str
     question_language: str
+    target_answer_language: str
     candidate_answer_language: str
     original_name_requested: bool
     localized_name_status: str
@@ -112,7 +113,7 @@ def should_run_localization_gate(
     return (
         decision.should_run_gate
         and decision.is_named_entity
-        and decision.question_language != decision.candidate_answer_language
+        and decision.target_answer_language != decision.candidate_answer_language
         and not decision.original_name_requested
         and decision.localized_name_status == "unresolved"
     )
@@ -172,15 +173,23 @@ def parse_localization_gate_decision(
     if not isinstance(payload, dict):
         return None
 
+    question_language = _coerce_enum(
+        payload.get("question_language"), LANGUAGE_VALUES, "unknown"
+    )
+    target_answer_language = _coerce_enum(
+        payload.get("target_answer_language"), LANGUAGE_VALUES, ""
+    )
+    if not target_answer_language:
+        target_answer_language = question_language
+
     decision = LocalizationGateDecision(
         should_run_gate=_coerce_bool(payload.get("should_run_gate"), False),
         candidate_answer=str(payload.get("candidate_answer", "")).strip(),
         entity_type=_coerce_enum(
             payload.get("entity_type"), ENTITY_TYPE_VALUES, "unknown"
         ),
-        question_language=_coerce_enum(
-            payload.get("question_language"), LANGUAGE_VALUES, "unknown"
-        ),
+        question_language=question_language,
+        target_answer_language=target_answer_language,
         candidate_answer_language=_coerce_enum(
             payload.get("candidate_answer_language"), LANGUAGE_VALUES, "unknown"
         ),

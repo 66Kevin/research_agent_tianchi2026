@@ -277,19 +277,21 @@ def generate_agent_summarize_prompt(task_description, agent_type=""):
             "Step 2. Normalize the answer into the correct final form.\n"
             "- First check whether the original question explicitly asks for an original name, native name, original-language title, real name, or similar.\n"
             "- If yes, output the official original/native full form, even if it is in a different language from the question.\n"
-            "- Otherwise, output the answer in the same language as the question.\n"
+            "- Otherwise, determine the target answer language before normalizing the answer.\n"
+            "- If the original question explicitly requests that the answer be given in a particular language, treat that as the target answer language.\n"
+            "- If no explicit output language is requested, use the question language as the target answer language.\n"
             "- If the conversation contains a `Localization Gate Result` block, treat it as the authoritative localization status.\n"
-            "- If a `Localization Gate Result` block is present and `localized_name_status` is `verified` or `best_effort`, use `localized_form_in_question_language` from that block.\n"
+            "- If a `Localization Gate Result` block is present and `localized_name_status` is `verified` or `best_effort`, use `localized_form_in_target_language` from that block.\n"
             "- If a `Localization Gate Result` block is present and `localized_name_status` is `NOT_FOUND`, use `verified_original_full_name` from that block.\n"
             "- If no `Localization Gate Result` block is present, use any verified localized full name already supported by the conversation.\n"
-            "- If the question is in Chinese and the answer entity is found in English, prefer the verified official Chinese full name or verified standard Chinese translation.\n"
-            "- If the question is in English, prefer the verified official English full name.\n"
+            "- If the target answer language is Chinese and the answer entity is found in another language, prefer the verified official Chinese full name or verified standard Chinese translation.\n"
+            "- If the target answer language is English, prefer the verified official English full name.\n"
             "- If neither a verified localized form nor an authoritative `Localization Gate Result` block is available, fall back to the verified official original full name.\n"
             "- If the question explicitly asks for the original/native form, ignore localization and output the verified original/native full form.\n"
             "- Always prefer the official full name/title over a short alias, abbreviation, shortened brand name, or partial name.\n"
-            "- For people, prefer the most standard reference name in the question language, usually first name + last name.\n"
+            "- For people, prefer the most standard reference name in the target answer language, usually first name + last name.\n"
             "- Do not automatically include a middle name or extra name parts just because a longer original-language form appears in the conversation.\n"
-            "- Use a longer person-name form only when the available evidence indicates that the longer form is the standard reference form in the question language.\n"
+            "- Use a longer person-name form only when the available evidence indicates that the longer form is the standard reference form in the target answer language.\n"
             "- For organizations, publishers, companies, schools, institutions, places, works, and titles, output the official full name/title.\n"
             "- For organizations, publishers, companies, schools, and institutions, if a `Localization Gate Result` block marks `localized_name_status: NOT_FOUND`, use `verified_original_full_name` rather than compressing to a shorter brand, alias, or shorthand form.\n"
             "- For works and titles, if a `Localization Gate Result` block marks `localized_name_status: NOT_FOUND`, use `verified_original_full_name` rather than inventing or shortening a translated title.\n"
@@ -299,7 +301,7 @@ def generate_agent_summarize_prompt(task_description, agent_type=""):
             "- Do not assume that a shorter or more familiar form is better if a fuller verified official name exists.\n"
             "- Do not prefer a shorter brand-style rendering over a fuller verified official name merely because the shorter form seems more familiar.\n"
             "- If both an abbreviated and a full official form appear in the conversation, prefer the full official form.\n"
-            "- If both an original-language full name and a verified localized full name appear in the conversation, choose according to the question language unless the question explicitly requests the original/native form.\n"
+            "- If both an original-language full name and a verified localized full name appear in the conversation, choose according to the target answer language unless the question explicitly requests the original/native form.\n"
             "- Do not output only a first name, only a surname, or a shortened form when a fuller official answer is supported by the conversation.\n"
             "- Do not remove words that are part of the official name.\n"
             "- The final summary stage cannot perform any new search. It must only normalize the answer based on evidence already present in the conversation.\n"
@@ -357,13 +359,15 @@ def generate_localization_gate_decision_prompt(task_description: str) -> str:
         '  "candidate_answer": "string",\n'
         '  "entity_type": "person|organization|publisher|company|school|institution|place|work|title|other_named_entity|non_named_entity|unknown",\n'
         '  "question_language": "zh|en|other|mixed|unknown",\n'
+        '  "target_answer_language": "zh|en|other|mixed|unknown",\n'
         '  "candidate_answer_language": "zh|en|other|mixed|unknown",\n'
         '  "original_name_requested": false,\n'
         '  "localized_name_status": "resolved_verified|resolved_best_effort|resolved_not_found|unresolved|skip_original_requested|not_applicable",\n'
         '  "reason": "brief explanation"\n'
         "}\n\n"
         "Decision rules:\n"
-        "- `should_run_gate` should be true only if the current answer candidate is a named entity, the candidate answer language differs from the question language, the question does not explicitly request the original/native form, and localization is still unresolved.\n"
+        "- Derive `target_answer_language` from the original question: if it explicitly requests a reply in a particular language, use that language; otherwise use `question_language`.\n"
+        "- `should_run_gate` should be true only if the current answer candidate is a named entity, the candidate answer language differs from the target answer language, the question does not explicitly request the original/native form, and localization is still unresolved.\n"
         "- If localization has already been resolved in the conversation, set `localized_name_status` accordingly and set `should_run_gate` to false.\n"
         "- Do not invent a new answer candidate just to justify the gate.\n"
         "- If the task is not about a named entity answer, set `entity_type` to `non_named_entity`.\n\n"
@@ -377,6 +381,7 @@ def generate_localization_gate_prompt(
     candidate_answer: str,
     entity_type: str,
     question_language: str,
+    target_answer_language: str,
     mode: str = "full",
 ) -> str:
     """Build the tool-using prompt for the pre-summary localization gate."""
@@ -388,17 +393,32 @@ def generate_localization_gate_prompt(
         )
         scope_line = (
             "Time is limited. Use the single highest-information-gain localization action only.\n"
-            "Prefer a direct name-normalization search in the question language unless an exact recent URL candidate is already available.\n"
+            "Prefer a direct name-normalization search in the target answer language unless an exact recent URL candidate is already available.\n"
         )
     else:
         tool_budget_line = "You may use at most 2 tool calls in total during this gate.\n"
         mode_line = "You are now in the Pre-Summary Localization Gate.\n\n"
         scope_line = ""
 
+    if target_answer_language == "zh":
+        source_preference_line = (
+            "- Official and institutional sources remain the highest authority.\n"
+            "- Within encyclopedia or major reference sources, prefer Baidu Baike first and Wiki second for Chinese-target localization.\n"
+            "- Use direct Chinese localization queries and prefer search patterns such as `site:baike.baidu.com` plus `中文名`, `官方中文名`, `中文全称`, `标准译名`, or `常见译名`.\n"
+            "- Use Wiki as a secondary encyclopedia/reference fallback when Baidu Baike does not resolve the localized form.\n"
+        )
+    else:
+        source_preference_line = (
+            "- Official and institutional sources remain the highest authority.\n"
+            "- Within encyclopedia or major reference sources, prefer Wiki first and Baidu Baike second for non-Chinese target localization.\n"
+            "- Use direct target-language name-normalization queries and prefer search patterns such as `site:wikipedia.org` plus `official English name`, `standard English title`, or equivalent target-language naming queries.\n"
+            "- Use Baidu Baike only as a secondary encyclopedia/reference fallback when Wiki does not resolve the localized form.\n"
+        )
+
     return (
         mode_line
         + "The semantic answer candidate has already been identified. Do NOT reopen the broader task-solving process.\n"
-        + "Do NOT search for new factual candidates. Only resolve the localized answer form, standard translation, official full name, or localized_name_status for the current answer candidate.\n"
+        + "Do NOT search for new factual candidates. Only resolve the localized answer form, standard translation, official full name, or localized_name_status for the current answer candidate in the target answer language.\n"
         + tool_budget_line
         + scope_line
         + "If there is no clear source URL yet, the first tool call must be `search_and_scrape_webpage/google_search`.\n"
@@ -408,16 +428,17 @@ def generate_localization_gate_prompt(
         + "Current candidate:\n"
         + f"- candidate_answer: {candidate_answer}\n"
         + f"- entity_type: {entity_type}\n"
-        + f"- question_language: {question_language}\n\n"
+        + f"- question_language: {question_language}\n"
+        + f"- target_answer_language: {target_answer_language}\n\n"
         + "Localization rules:\n"
-        + "- Prefer official, institutional, library-catalog, museum-catalog, academic, or major reference sources in the question language.\n"
-        + "- For person answers, prefer the most standard reference name in the question language, usually first name + last name.\n"
+        + "- Prefer official, institutional, library-catalog, museum-catalog, academic, or major reference sources in the target answer language.\n"
+        + source_preference_line
+        + "- For person answers, prefer the most standard reference name in the target answer language, usually first name + last name.\n"
         + "- Do not automatically include middle names or extra name parts unless evidence shows that the longer form is the standard target-language reference form.\n"
         + "- For organizations, publishers, companies, schools, institutions, places, works, and titles, start from the verified original full name rather than a shorthand alias.\n"
         + "- If you cannot find a verified localized form, gather enough evidence to support a defensible best-effort localized form or conclude `localized_name_status = NOT_FOUND`.\n"
         + "- Do not invent a new candidate answer.\n\n"
-        + "When searching, use direct name-normalization queries in the question language.\n"
-        + "For Chinese localization, prioritize keywords such as `中文名`, `官方中文名`, `中文全称`, `标准译名`, `常见译名`.\n\n"
+        + "When searching, use direct name-normalization queries in the target answer language.\n\n"
         + "Original question for reference:\n"
         + f'"{task_description}"\n'
     ).strip()
@@ -427,6 +448,7 @@ def generate_localization_gate_result_prompt(
     task_description: str,
     candidate_answer: str,
     entity_type: str,
+    target_answer_language: str,
     gate_mode: str = "full",
 ) -> str:
     """Build the no-tools prompt that summarizes the localization gate outcome."""
@@ -448,20 +470,22 @@ def generate_localization_gate_result_prompt(
         + "- candidate_answer: ...\n"
         + "- entity_type: ...\n"
         + "- question_language: ...\n"
+        + "- target_answer_language: ...\n"
         + "- original_name_requested: yes/no\n"
         + "- localized_name_status: verified / best_effort / NOT_FOUND\n"
-        + "- localized_form_in_question_language: ...\n"
+        + "- localized_form_in_target_language: ...\n"
         + "- verified_original_full_name: ...\n"
         + "- source_basis: ...\n"
         + "- source_quality: official / institutional / reference / mixed / weak\n"
         + "- notes: ...\n\n"
         + "Rules:\n"
         + f"- The candidate answer is `{candidate_answer}` and the entity type is `{entity_type}`.\n"
+        + f"- The target answer language is `{target_answer_language}`.\n"
         + "- `localized_name_status` must be exactly one of: `verified`, `best_effort`, `NOT_FOUND`.\n"
         + "- Use `verified` only when the conversation supports a localized form with defensible source support.\n"
         + "- Use `best_effort` only when no verified localized form was found but the conversation supports a defensible target-language rendering.\n"
         + "- Use `NOT_FOUND` only when the conversation supports no reliable localized form and no defensible best-effort localized rendering.\n"
-        + "- If `localized_name_status` is `verified` or `best_effort`, fill `localized_form_in_question_language`.\n"
+        + "- If `localized_name_status` is `verified` or `best_effort`, fill `localized_form_in_target_language`.\n"
         + "- Always provide `verified_original_full_name`.\n"
         + f"{mode_instructions}"
         + "- Do not include any extra sections, JSON, or markdown.\n\n"

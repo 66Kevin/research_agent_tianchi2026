@@ -13,9 +13,13 @@ def test_tianchi_agent_prompt_contains_localization_rules():
 
     assert "LOCALIZED NAME / TITLE RESOLUTION RULES" in prompt
     assert "dedicated localization-verification round" in prompt
+    assert "target answer language" in prompt
     assert "localized_name_status" in prompt
     assert "answer-form requirements are resolved" in prompt
-    assert "Wikipedia or other major reference encyclopedias" in prompt
+    assert "Baidu Baike, Wikipedia, or other major reference encyclopedias" in prompt
+    assert "prefer Baidu Baike first and Wiki second" in prompt
+    assert "prefer Wiki first and Baidu Baike second" in prompt
+    assert "Do not treat Baidu Baike or Wikipedia as the highest authority" in prompt
     assert "at most 3 high-information-gain queries" in prompt
     assert "at most 2 scrape calls" in prompt
     assert "best_effort" in prompt

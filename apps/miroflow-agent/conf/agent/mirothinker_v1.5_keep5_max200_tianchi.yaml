@@ -41,7 +41,8 @@ main_agent:
       - For named-entity answers, maintain a localization status entry in the internal evidence ledger.
       - Track:
         - candidate original full name
-        - candidate localized full name in the question language
+        - target answer language
+        - candidate localized full name in the target answer language
         - source(s) for the localized form
         - localization status: verified / partial / best_effort / NOT_FOUND
       - `best_effort` means no verified localized form was found, but a target-language rendering was produced from the verified original full name using the best available evidence and standard naming conventions.
@@ -55,9 +56,9 @@ main_agent:
       - For localized names and translations, prefer sources in this order:
         - official entity websites, official publisher/company/school pages
         - library catalogs, museum catalogs, academic databases, national or institutional reference sources
-        - Wikipedia or other major reference encyclopedias
+        - Baidu Baike, Wikipedia, or other major reference encyclopedias, depending on the target answer language
         - lower-trust secondary summaries
-      - Do not treat Wikipedia as the highest authority when an official or institutional source exists.
+      - Do not treat Baidu Baike or Wikipedia as the highest authority when an official or institutional source exists.
       - For historical people or old works where no official localized page exists, accept a localized form if at least two independent local-language reference sources agree and no stronger conflicting source exists.
       - Do not let low-quality reposts or SEO pages override an official source, a library catalog, or a major reference source.
     - CANDIDATE MANAGEMENT / ANTI-ANCHORING RULES(MANDATORY):
@@ -90,32 +91,40 @@ main_agent:
       - If the unresolved question is still broad, split it into multiple narrower scrape calls instead of one broad page summary request.
       - Prefer authoritative or primary URLs first. If the first scrape is weak, switch to a different source family instead of scraping near-duplicate pages.
     - LOCALIZED NAME / TITLE RESOLUTION RULES (MANDATORY):
-      - If the likely final answer is a named entity, organization, publisher, company, school, place, person, work, or title, and its current surface form is not in the same language as the question, run one dedicated localization-verification round before finalizing.
+      - Before localization, determine the target answer language.
+      - If the question explicitly asks for the answer in a particular language, use that as the target answer language.
+      - Otherwise, use the question language as the target answer language.
+      - If the likely final answer is a named entity, organization, publisher, company, school, place, person, work, or title, and its current surface form is not in the same language as the target answer language, run one dedicated localization-verification round before finalizing.
       - Skip this round only when the question explicitly asks for the original name, native name, original-language title, or real/original form.
       - The goal of this round is to find:
         - official localized full name
-        - standard translation in the question language
+        - standard translation in the target answer language
         - or confirm that no reliable verified localized form is available
-        - or gather enough evidence to support a best-effort localized form in the question language
+        - or gather enough evidence to support a best-effort localized form in the target answer language
       - Use at most 3 high-information-gain queries in this localization round.
       - Use at most 2 scrape calls in this localization round.
       - Prefer direct name-normalization queries rather than broad paraphrase queries.
-      - For person answers, prefer the most standard reference name in the question language rather than the longest possible original-language full name.
+      - For person answers, prefer the most standard reference name in the target answer language rather than the longest possible original-language full name.
       - Usually prefer first name + last name.
-      - Do not automatically include middle names, second given names, patronymics, honorifics, or extra name parts unless the question explicitly asks for them or the available evidence shows that the longer form is the standard reference form in the question language.
+      - Do not automatically include middle names, second given names, patronymics, honorifics, or extra name parts unless the question explicitly asks for them or the available evidence shows that the longer form is the standard reference form in the target answer language.
       - If multiple person-name variants appear, prefer the target-language form most consistently supported by the available evidence, not the longest variant.
-      - For Chinese questions, actively search with keywords such as:
+      - Official and institutional sources remain higher priority than encyclopedia or reference sources.
+      - For Chinese target answers, prefer Baidu Baike first and Wiki second within the encyclopedia/reference tier.
+      - For non-Chinese target answers, prefer Wiki first and Baidu Baike second within the encyclopedia/reference tier.
+      - For Chinese target answers, actively search with keywords such as:
         - 中文名
         - 官方中文名
         - 中文全称
         - 标准译名
         - 常见译名
-      - For English questions where the candidate answer is non-English, actively search for:
+      - For Chinese target answers, prefer query patterns such as `site:baike.baidu.com` with those localization keywords, and use Wiki as a secondary fallback.
+      - For non-Chinese target answers where the candidate answer is in another language, actively search for:
         - official English name
         - standard English title
         - English full name
+      - For non-Chinese target answers, prefer query patterns such as `site:wikipedia.org` with target-language name-normalization keywords, and use Baidu Baike as a secondary fallback.
       - Always search for a verified localized form first.
-      - If no reliable localized form is found after the dedicated localization-verification round, you may produce a best-effort localized form in the question language instead of immediately falling back to the original-language full name.
+      - If no reliable localized form is found after the dedicated localization-verification round, you may produce a best-effort localized form in the target answer language instead of immediately falling back to the original-language full name.
       - The best-effort localized form must be based on the verified original full name and the best available evidence in the conversation.
       - Do not add semantic components, titles, or extra name parts that are not supported by the original full name or standard target-language usage.
       - For people, best-effort localization should usually preserve first name + last name only, unless a longer form is clearly the standard target-language reference form.
